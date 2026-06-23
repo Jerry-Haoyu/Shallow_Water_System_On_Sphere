@@ -1,0 +1,22 @@
+\contentsline {section}{\numberline {1}Shallow Water Equations on the Sphere in Vorticity--Divergence Form}{1}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Helmholtz Decomposition on the Sphere}{1}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Diagonalisation of the Laplacian in the Spherical Harmonic Basis}{2}{subsection.1.2}%
+\contentsline {paragraph}{Proof.}{2}{section*.2}%
+\contentsline {paragraph}{From $(\zeta ,\delta )$ back to $(u,v)$.}{3}{section*.4}%
+\contentsline {section}{\numberline {2}Algorithm in Pseudocode}{4}{section.2}%
+\contentsline {section}{\numberline {3}Line-by-Line Translation of the Pseudocode to Python}{5}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Module imports and device selection}{5}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Constructor: \texttt {ShallowWaterSolver.\_\_init\_\_}}{5}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Spectral / grid utilities}{6}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Vorticity / divergence transforms}{6}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Diagnostics: potential vorticity and non-dimensionalisation}{7}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Tendency: \texttt {dudtspec} (Algorithm 2)}{7}{subsection.3.6}%
+\contentsline {subsection}{\numberline {3.7}Initial condition: \texttt {galewsky\_initial\_condition}}{8}{subsection.3.7}%
+\contentsline {subsection}{\numberline {3.8}Time integration: \texttt {timestep} (Algorithm 1, loop body)}{9}{subsection.3.8}%
+\contentsline {subsection}{\numberline {3.9}Driver: \texttt {main}}{9}{subsection.3.9}%
+\contentsline {section}{\numberline {4}Contour Advective Semi-Lagrangian (CASL) Method}{10}{section.4}%
+\contentsline {subsection}{\numberline {4.1}The CASL state and the two-grid idea}{11}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}PV inversion on the sphere}{11}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Pseudocode}{11}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Inversion sub-routine}{12}{subsection.4.4}%
+\contentsline {subsection}{\numberline {4.5}Where the SHT still pays off}{12}{subsection.4.5}%

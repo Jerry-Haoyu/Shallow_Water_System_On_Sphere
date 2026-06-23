@@ -1,0 +1,900 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+
+\definecolor{codegreen}{rgb}{0.0,0.5,0.0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.96,0.96,0.92}
+
+\lstdefinestyle{pystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{blue},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    language=Python
+}
+\lstset{style=pystyle}
+
+\title{A Pseudo-Spectral Solver for the Shallow Water Equations on the Sphere:\\
+       A Manual for \texttt{psuedo\_spectral.py}}
+\author{}
+\date{\today}
+
+\newcommand{\bvec}[1]{\boldsymbol{#1}}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\bigskip
+
+%==============================================================
+\section{Shallow Water Equations on the Sphere in
+         Vorticity--Divergence Form}
+%==============================================================
+
+The classical shallow water equations (SWE) on a rotating sphere of radius
+$a$ may be written for a horizontal velocity field
+$\bvec{v} = (u,v)$ and free-surface height $h$ as
+\begin{align}
+    \frac{\partial \bvec{v}}{\partial t} + (\bvec{v}\cdot \nabla)\bvec{v}
+        + f\,\hat{\bvec{k}}\times\bvec{v}
+        &= -g\nabla h, \label{eq:mom}\\
+    \frac{\partial h}{\partial t} + \nabla\cdot(h\,\bvec{v}) &= 0,
+        \label{eq:cont}
+\end{align}
+where $f = 2\Omega\sin\phi$ is the Coriolis parameter, $\Omega$ is the
+planetary angular velocity, $g$ is gravity, and $\phi$ is latitude.
+
+For a pseudo-spectral discretization based on spherical harmonics it is
+convenient to replace the prognostic variables $(u,v,h)$ by the
+vorticity, divergence, and geopotential
+\begin{equation}
+    \zeta \;=\; \hat{\bvec{k}}\cdot(\nabla\times\bvec{v}),
+    \qquad
+    \delta \;=\; \nabla\cdot\bvec{v},
+    \qquad
+    \Phi \;=\; g\,h .
+\end{equation}
+\subsection{Helmholtz Decomposition on the Sphere}
+
+Any sufficiently smooth tangent vector field $\bvec{v}$ on the
+two-sphere $S^{2}$ admits a unique decomposition into a
+\emph{rotational} (divergence-free) part and an \emph{irrotational}
+(curl-free) part:
+\begin{equation}
+    \bvec{v} \;=\;
+        \underbrace{\hat{\bvec{k}}\times\nabla\psi}_{\text{rotational}}
+        \;+\;
+        \underbrace{\nabla\chi}_{\text{irrotational}},
+    \label{eq:helmholtz}
+\end{equation}
+where $\psi$ is the \emph{stream function} and $\chi$ is the
+\emph{velocity potential}.  The decomposition follows from the Hodge
+theorem on a compact orientable manifold: every 1-form on $S^{2}$
+splits as $\omega = d\chi + \star d\psi + h$, where $h$ is harmonic.
+Because $S^{2}$ has trivial first cohomology, the harmonic part
+vanishes, leaving only the two scalar potentials.  Uniqueness of
+$\psi,\chi$ is enforced by requiring zero global mean,
+$\int_{S^{2}}\psi\,dS = \int_{S^{2}}\chi\,dS = 0$.
+
+Taking the (scalar) curl and the divergence of \eqref{eq:helmholtz}
+yields
+\begin{equation}
+    \zeta \;\equiv\; \hat{\bvec{k}}\!\cdot\!(\nabla\!\times\!\bvec{v})
+          \;=\; \nabla^{2}\psi,
+    \qquad
+    \delta \;\equiv\; \nabla\!\cdot\!\bvec{v}
+          \;=\; \nabla^{2}\chi ,
+    \label{eq:hh-laplacians}
+\end{equation}
+using the spherical identities
+$\nabla\!\cdot\!(\hat{\bvec{k}}\!\times\!\nabla\psi)=0$
+and
+$\hat{\bvec{k}}\!\cdot\!(\nabla\!\times\!\nabla\chi)=0$.
+Thus knowing $(\zeta,\delta)$ determines $(\psi,\chi)$ uniquely up to a
+constant by inverting the Laplace--Beltrami operator on $S^{2}$, and
+hence determines the velocity through \eqref{eq:helmholtz}.  This is
+exactly the operation performed by the routine \texttt{getuv}.
+
+\subsection{Diagonalisation of the Laplacian in the Spherical Harmonic
+            Basis}
+
+The Laplace--Beltrami operator on a sphere of radius $a$ in
+$(\lambda,\phi)$ coordinates ($\lambda\in[0,2\pi)$ longitude,
+$\phi\in[-\pi/2,\pi/2]$ latitude) reads
+\begin{equation}
+    \nabla^{2} f \;=\;
+        \frac{1}{a^{2}\cos\phi}\frac{\partial}{\partial\phi}\!
+        \left(\cos\phi\,\frac{\partial f}{\partial\phi}\right)
+        +
+        \frac{1}{a^{2}\cos^{2}\phi}\,\frac{\partial^{2} f}{\partial\lambda^{2}}.
+    \label{eq:laplace-beltrami}
+\end{equation}
+The (real, normalized) spherical harmonics
+\begin{equation}
+    Y_{\ell m}(\lambda,\phi) \;=\;
+        N_{\ell m}\, P_{\ell}^{|m|}(\sin\phi)\,
+        \begin{cases}\cos(m\lambda),& m\ge 0,\\ \sin(|m|\lambda),& m<0,\end{cases}
+        \qquad \ell\ge 0,\ |m|\le \ell,
+\end{equation}
+are eigenfunctions of $\nabla^{2}$ with eigenvalues
+$-\ell(\ell+1)/a^{2}$.
+
+\paragraph{Proof.}
+Writing $\mu = \sin\phi$ so that $\cos\phi\,d\phi = d\mu$ and
+$\cos^{2}\phi = 1-\mu^{2}$, \eqref{eq:laplace-beltrami} becomes
+\begin{equation}
+    \nabla^{2} f \;=\;
+        \frac{1}{a^{2}}\left[\frac{\partial}{\partial\mu}\!
+        \Bigl((1-\mu^{2})\frac{\partial f}{\partial\mu}\Bigr)
+        + \frac{1}{1-\mu^{2}}\,\frac{\partial^{2} f}{\partial\lambda^{2}}\right].
+\end{equation}
+Substituting $Y_{\ell m}(\lambda,\mu) = P_{\ell}^{|m|}(\mu)\,e^{im\lambda}$
+(complex form is sufficient for the eigenvalue calculation),
+\begin{align*}
+    \frac{\partial^{2} Y_{\ell m}}{\partial\lambda^{2}}
+        &= -m^{2}\,Y_{\ell m},\\
+    \frac{\partial}{\partial\mu}\!\Bigl((1-\mu^{2})
+        \frac{\partial Y_{\ell m}}{\partial\mu}\Bigr)
+        &= e^{im\lambda}\,\frac{d}{d\mu}\!\Bigl((1-\mu^{2})
+          \frac{dP_{\ell}^{|m|}}{d\mu}\Bigr).
+\end{align*}
+The associated Legendre function $P_{\ell}^{|m|}$ satisfies the
+associated Legendre equation
+\begin{equation}
+    \frac{d}{d\mu}\!\Bigl((1-\mu^{2})\frac{dP_{\ell}^{|m|}}{d\mu}\Bigr)
+    +\Bigl(\ell(\ell+1) - \frac{m^{2}}{1-\mu^{2}}\Bigr)P_{\ell}^{|m|}
+    \;=\; 0,
+    \label{eq:assoc-legendre}
+\end{equation}
+hence
+\begin{equation}
+    \frac{d}{d\mu}\!\Bigl((1-\mu^{2})\frac{dP_{\ell}^{|m|}}{d\mu}\Bigr)
+    \;=\; -\ell(\ell+1)P_{\ell}^{|m|}
+          + \frac{m^{2}}{1-\mu^{2}}P_{\ell}^{|m|}.
+\end{equation}
+Plugging back in,
+\begin{equation}
+    \nabla^{2} Y_{\ell m} \;=\;
+        \frac{1}{a^{2}}\Bigl[-\ell(\ell+1) + \frac{m^{2}}{1-\mu^{2}}
+        - \frac{m^{2}}{1-\mu^{2}}\Bigr] Y_{\ell m}
+        \;=\; -\frac{\ell(\ell+1)}{a^{2}}\,Y_{\ell m}.
+    \tag*{$\blacksquare$}
+\end{equation}
+
+Because $\{Y_{\ell m}\}$ is a complete orthonormal basis of
+$L^{2}(S^{2})$, an arbitrary field $f$ expands as
+$f = \sum_{\ell,m} \hat f_{\ell m}\,Y_{\ell m}$, and the action of the
+Laplacian on the coefficient vector is the diagonal multiplication
+\begin{equation}
+    \widehat{\nabla^{2} f}_{\ell m}
+        \;=\; -\frac{\ell(\ell+1)}{a^{2}}\,\hat f_{\ell m},
+    \qquad
+    \widehat{\nabla^{-2} f}_{\ell m}
+        \;=\; -\frac{a^{2}}{\ell(\ell+1)}\,\hat f_{\ell m}
+        \quad(\ell\ge 1),
+    \label{eq:lap-diag}
+\end{equation}
+with the $\ell=0$ mode (a global constant) lying in the kernel and
+treated separately.  Two consequences are immediate:
+\begin{itemize}
+    \item Solving the Poisson problems \eqref{eq:hh-laplacians} for
+          $\psi,\chi$ from $(\zeta,\delta)$ reduces to one division per
+          mode --- the entire elliptic inversion is $O(N^{2})$ once
+          the transform itself has been computed.
+    \item Higher powers $\nabla^{2k}$ used in hyperdiffusion are equally
+          diagonal, with eigenvalues
+          $\bigl(-\ell(\ell+1)/a^{2}\bigr)^{k}$.
+\end{itemize}
+
+\paragraph{From $(\zeta,\delta)$ back to $(u,v)$.}
+On the sphere the horizontal gradient and the rotated gradient have
+clean expressions in vector spherical harmonics
+$\bvec{\Psi}_{\ell m}=\nabla Y_{\ell m}$ and
+$\bvec{\Phi}_{\ell m}=\hat{\bvec{k}}\times\nabla Y_{\ell m}$:
+\begin{equation}
+    \bvec{v}
+        \;=\; \sum_{\ell\ge1,m}\Bigl[
+            \hat\psi_{\ell m}\,\bvec{\Phi}_{\ell m}
+            + \hat\chi_{\ell m}\,\bvec{\Psi}_{\ell m}\Bigr],
+        \qquad
+    \hat\psi_{\ell m} = -\frac{a^{2}}{\ell(\ell+1)}\hat\zeta_{\ell m},
+    \quad
+    \hat\chi_{\ell m} = -\frac{a^{2}}{\ell(\ell+1)}\hat\delta_{\ell m}.
+\end{equation}
+This is precisely what the (inverse) vector SHT does in
+\texttt{getuv}: multiply $(\hat\zeta,\hat\delta)$ by the diagonal
+factor $-a^{2}/[\ell(\ell+1)]/a = -a/[\ell(\ell+1)]$ and apply the
+inverse vector transform to get $(u,v)$.  In the code,
+\texttt{self.lap * self.radius} carries the $\ell(\ell+1)/a$ factor
+(with a minus sign absorbed into \texttt{invlap}), exactly inverting
+this map in \texttt{vrtdivspec}.
+
+\subsection*{Potential Vorticity}
+
+The shallow-water potential vorticity (PV) is the absolute vorticity
+divided by the layer thickness,
+\begin{equation}
+    q \;=\; \frac{\zeta + f}{h}.
+\end{equation}
+For an inviscid flow, $q$ is materially conserved,
+$Dq/Dt = 0$, and is a central diagnostic of the Galewsky test case.
+In the code a non-dimensionalised version is computed,
+\begin{equation}
+    \tilde q \;=\; \frac{\bar h\, g}{2\Omega}\,
+        \frac{\zeta + f}{\Phi},
+    \label{eq:pv_code}
+\end{equation}
+where $\bar h$ is the mean layer depth.
+
+\subsection*{Prognostic System in $(\Phi,\zeta,\delta)$}
+
+Taking the curl and divergence of \eqref{eq:mom} and combining with
+\eqref{eq:cont} yields the equations actually integrated:
+\begin{align}
+    \frac{\partial \zeta}{\partial t}
+        &= -\nabla\cdot\bigl[(\zeta + f)\,\bvec{v}\bigr],
+        \label{eq:dvrt}\\
+    \frac{\partial \delta}{\partial t}
+        &=  \hat{\bvec{k}}\cdot\nabla\times\bigl[(\zeta+f)\,\bvec{v}\bigr]
+            - \nabla^{2}\!\Bigl(\Phi + \tfrac{1}{2}|\bvec{v}|^{2}\Bigr),
+        \label{eq:ddiv}\\
+    \frac{\partial \Phi}{\partial t}
+        &= -\nabla\cdot(\Phi\,\bvec{v}). \label{eq:dphi}
+\end{align}
+In a vector spherical harmonic basis the operator $\nabla\cdot$ and
+$\hat{\bvec{k}}\cdot\nabla\times$ acting on a horizontal vector field
+return, respectively, the divergence and vorticity spectral
+coefficients (up to a factor of the radius and the eigenvalue of the
+Laplacian); this is what the routine \texttt{vrtdivspec} performs.
+
+Equations \eqref{eq:dvrt}--\eqref{eq:dphi} together with the
+diagnostic relation $\bvec{v} = \nabla^{-2}(\,\hat{\bvec{k}}\times
+\nabla\zeta + \nabla\delta\,)$ form a closed system; this is the
+system implemented in \texttt{psuedo\_spectral.py}.
+
+%==============================================================
+\section{Algorithm in Pseudocode}
+%==============================================================
+
+The solver advances the state vector
+$\bvec{U} = (\hat\Phi,\,\hat\zeta,\,\hat\delta)$ of spectral
+coefficients with a third-order Adams--Bashforth scheme.  Nonlinear
+products are evaluated on the physical grid (the pseudo-spectral idea)
+while time stepping and the Laplacian-based diagnostics are performed in
+spectral space.  Implicit hyperdiffusion is applied to $\zeta$ and
+$\delta$ at the end of each step.
+
+\begin{algorithm}[H]
+\caption{Pseudo-spectral integration of the shallow-water equations.}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $n_{\mathrm{lat}}$, $n_{\mathrm{lon}}$, $\Delta t$,
+       physical constants $(a,\Omega,g,\bar h,\hat h)$,
+       number of steps $N$.
+\State \textbf{Precompute:}
+        Gaussian / Clenshaw--Curtiss latitudes and weights;
+        spherical-harmonic transforms (scalar and vector);
+        Laplacian eigenvalues $\lambda_\ell = -\ell(\ell+1)/a^{2}$
+        and inverse $\lambda_\ell^{-1}$;
+        Coriolis field $f = 2\Omega\sin\phi$;
+        hyperdiffusion operator
+        $\mathcal{H} = \exp\!\bigl(-\tfrac{\Delta t}{2\cdot 3600}
+        (\lambda/\lambda_{\max})^{4}\bigr)$.
+\State Build initial condition $\bvec{U}^{0}$ from the Galewsky jet:
+       compute $u(\phi)$, optional perturbation $h_{\text{bump}}$,
+       transform to $(\hat\zeta,\hat\delta)$ via \texttt{vrtdivspec},
+       and obtain $\hat\Phi$ from the nonlinear balance equation.
+\For{$n = 0,1,\dots,N-1$}
+    \State $\mathrm{tend}^{(\mathrm{new})} \gets \texttt{dudtspec}(\bvec{U}^{n})$
+           \Comment{Evaluate RHS \eqref{eq:dvrt}--\eqref{eq:dphi}}
+    \If{$n = 0$}
+        $\mathrm{tend}^{(\mathrm{now})}\gets\mathrm{tend}^{(\mathrm{old})}\gets\mathrm{tend}^{(\mathrm{new})}$
+        \Comment{Forward Euler bootstrap}
+    \ElsIf{$n = 1$}
+        $\mathrm{tend}^{(\mathrm{old})}\gets\mathrm{tend}^{(\mathrm{new})}$
+        \Comment{2nd-order AB bootstrap}
+    \EndIf
+    \State $\bvec{U}^{n+1} \gets \bvec{U}^{n} + \Delta t\!\left(
+            \frac{23}{12}\mathrm{tend}^{(\mathrm{new})}
+            - \frac{16}{12}\mathrm{tend}^{(\mathrm{now})}
+            + \frac{5}{12}\mathrm{tend}^{(\mathrm{old})}\right)$
+    \State $(\hat\zeta,\hat\delta)^{n+1} \gets
+            \mathcal{H}\cdot(\hat\zeta,\hat\delta)^{n+1}$
+            \Comment{Implicit hyperdiffusion}
+    \State Cyclically permute the tendency buffers
+           $(\mathrm{new},\mathrm{now},\mathrm{old})$.
+\EndFor
+\State \textbf{Return} $\bvec{U}^{N}$.
+\end{algorithmic}
+\end{algorithm}
+
+\bigskip
+\noindent The right-hand-side routine \texttt{dudtspec}
+implements equations \eqref{eq:dvrt}--\eqref{eq:dphi}
+in the following pseudocode form:
+
+\begin{algorithm}[H]
+\caption{\texttt{dudtspec}: tendency of $(\hat\Phi,\hat\zeta,\hat\delta)$.}
+\begin{algorithmic}[1]
+\State Transform spectral state to the grid:
+       $(\Phi,\zeta,\delta) \gets \texttt{spec2grid}(\bvec{U})$.
+\State Recover wind from vorticity and divergence:
+       $(u,v) \gets \texttt{getuv}(\hat\zeta,\hat\delta)$.
+\State Form the flux $\bvec{F} = (u,v)\,(\zeta + f)$.
+\State $(\hat A,\hat B) \gets \texttt{vrtdivspec}(\bvec{F})$,
+       set
+       $\partial_t\hat\delta = \hat A$,
+       $\partial_t\hat\zeta  = -\hat B$.
+\State Form the mass flux $\bvec{G} = (u,v)\,\Phi$,
+       compute $(\hat C,\hat D) \gets \texttt{vrtdivspec}(\bvec{G})$,
+       set $\partial_t\hat\Phi = -\hat D$.
+\State Add the gradient term:
+       $\partial_t\hat\delta \mathrel{-}=
+          \nabla^{2}\!\bigl[\Phi + \tfrac{1}{2}(u^{2}+v^{2})\bigr]$.
+\State \textbf{Return} $(\partial_t\hat\Phi,\partial_t\hat\zeta,
+                        \partial_t\hat\delta)$.
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================
+\section{Line-by-Line Translation of the Pseudocode to Python}
+%==============================================================
+
+In what follows each block of \texttt{psuedo\_spectral.py} is shown
+together with the step of the algorithm it implements.
+
+\subsection{Module imports and device selection}
+
+The solver relies on \texttt{torch\_harmonics} for the spherical-harmonic
+transforms and runs on GPU when available.
+
+\begin{lstlisting}
+import torch
+import torch.nn as nn
+import numpy as np
+from math import ceil
+import os, sys
+
+from torch_harmonics.sht import *
+import torch_harmonics as harmonics
+from torch_harmonics.quadrature import *
+from torch_harmonics.quadrature import _precompute_longitudes, _precompute_latitudes
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+\end{lstlisting}
+
+\subsection{Constructor: \texttt{ShallowWaterSolver.\_\_init\_\_}}
+
+The constructor stores physical constants, builds the SHT objects,
+the Laplacian (and its inverse), the Coriolis field, and the
+hyperdiffusion operator described in the precompute step of
+Algorithm~1.
+
+\begin{lstlisting}
+class ShallowWaterSolver(nn.Module):
+    def __init__(self, nlat, nlon, dt, lmax=None, mmax=None,
+                 grid="equiangular", radius=6.37122E6,
+                 omega=7.292E-5, gravity=9.80616,
+                 havg=10.e3, hamp=120.):
+        super().__init__()
+        # ---- store dt and grid sizes ----
+        self.dt   = dt
+        self.nlat = nlat
+        self.nlon = nlon
+        self.grid = grid
+
+        # ---- physical constants (registered as buffers) ----
+        self.register_buffer('radius',  torch.as_tensor(radius,  dtype=torch.float64))
+        self.register_buffer('omega',   torch.as_tensor(omega,   dtype=torch.float64))
+        self.register_buffer('gravity', torch.as_tensor(gravity, dtype=torch.float64))
+        self.register_buffer('havg',    torch.as_tensor(havg,    dtype=torch.float64))
+        self.register_buffer('hamp',    torch.as_tensor(hamp,    dtype=torch.float64))
+
+        # ---- scalar and vector spherical harmonic transforms ----
+        self.sht   = harmonics.RealSHT(nlat, nlon, lmax=lmax, mmax=mmax,
+                                       grid=grid, csphase=False)
+        self.isht  = harmonics.InverseRealSHT(nlat, nlon, lmax=lmax, mmax=mmax,
+                                              grid=grid, csphase=False)
+        self.vsht  = harmonics.RealVectorSHT(nlat, nlon, lmax=lmax, mmax=mmax,
+                                             grid=grid, csphase=False)
+        self.ivsht = harmonics.InverseRealVectorSHT(nlat, nlon, lmax=lmax, mmax=mmax,
+                                                    grid=grid, csphase=False)
+        self.lmax = self.sht.lmax
+        self.mmax = self.sht.mmax
+\end{lstlisting}
+
+\noindent
+The quadrature points are computed in a grid-dependent way
+(Gauss--Legendre, Lobatto, or equiangular / Clenshaw--Curtiss):
+
+\begin{lstlisting}
+        if   self.grid == "legendre-gauss":
+            cost, quad_weights = harmonics.quadrature.legendre_gauss_weights(self.nlat, -1, 1)
+        elif self.grid == "lobatto":
+            cost, quad_weights = harmonics.quadrature.lobatto_weights(self.nlat, -1, 1)
+        elif self.grid == "equiangular":
+            cost, quad_weights = harmonics.quadrature.clenshaw_curtiss_weights(self.nlat, -1, 1)
+        quad_weights = quad_weights.reshape(-1, 1)
+        lats = -torch.arcsin(cost)                      # latitude grid
+        lons = _precompute_longitudes(self.nlon)        # longitude grid
+\end{lstlisting}
+
+\noindent
+The Laplacian eigenvalues $-\ell(\ell+1)/a^{2}$ and the inverse
+Laplacian (with $\ell=0$ excluded) are built next, followed by the
+Coriolis field $2\Omega\sin\phi$ and the spectral hyperdiffusion
+operator $\mathcal{H}$:
+
+\begin{lstlisting}
+        # ---- Laplacian and its inverse ----
+        l    = torch.arange(0, self.lmax).reshape(self.lmax, 1).double()
+        l    = l.expand(self.lmax, self.mmax)
+        lap     = - l * (l + 1) / self.radius**2
+        invlap  = - self.radius**2 / l / (l + 1)
+        invlap[0] = 0.
+
+        # ---- Coriolis force ----
+        coriolis = 2 * self.omega * torch.sin(lats).reshape(self.nlat, 1)
+
+        # ---- spectral hyperdiffusion ----
+        hyperdiff = torch.exp(torch.asarray(
+            (-self.dt / 2 / 3600.) * (lap / lap[-1, 0])**4))
+
+        # register all precomputed tensors
+        for name, val in [('lats',lats),('lons',lons),('l',l),
+                          ('lap',lap),('invlap',invlap),
+                          ('coriolis',coriolis),('hyperdiff',hyperdiff),
+                          ('quad_weights',quad_weights)]:
+            self.register_buffer(name, val)
+\end{lstlisting}
+
+\subsection{Spectral / grid utilities}
+
+These wrap the scalar SHT to move between physical and spectral space.
+
+\begin{lstlisting}
+    def grid2spec(self, ugrid):
+        return self.sht(ugrid)
+
+    def spec2grid(self, uspec):
+        return self.isht(uspec)
+\end{lstlisting}
+
+\subsection{Vorticity / divergence transforms}
+
+\texttt{vrtdivspec} converts a horizontal vector field on the grid to
+$(\hat\zeta,\hat\delta)$ by applying the vector SHT and multiplying by
+$a\,\lambda_{\ell}$. \texttt{getuv} is its inverse and corresponds to
+the Helmholtz reconstruction $\bvec{v} =
+\hat{\bvec{k}}\times\nabla\psi + \nabla\chi$.
+
+\begin{lstlisting}
+    def vrtdivspec(self, ugrid):
+        # multiplying by lap * radius converts the vector-SHT coefficients
+        # of (u,v) into spectral coefficients of (zeta, delta)
+        return self.lap * self.radius * self.vsht(ugrid)
+
+    def getuv(self, vrtdivspec):
+        # inverse: divide by lap*radius and apply inverse vector SHT
+        return self.ivsht(self.invlap * vrtdivspec / self.radius)
+\end{lstlisting}
+
+\noindent
+The convenience routine \texttt{gethuv} reconstructs $(h,u,v)$ on the
+grid from the full state vector.
+
+\begin{lstlisting}
+    def gethuv(self, uspec):
+        hgrid  = self.spec2grid(uspec[:1])
+        uvgrid = self.getuv(uspec[1:])
+        return torch.cat((hgrid, uvgrid), dim=-3)
+\end{lstlisting}
+
+\subsection{Diagnostics: potential vorticity and non-dimensionalisation}
+
+Equation~\eqref{eq:pv_code} is computed directly on the grid:
+
+\begin{lstlisting}
+    def potential_vorticity(self, uspec):
+        ugrid = self.spec2grid(uspec)
+        pvrt  = (0.5 * self.havg * self.gravity / self.omega) \
+                * (ugrid[1] + self.coriolis) / ugrid[0]
+        return pvrt
+\end{lstlisting}
+
+\begin{lstlisting}
+    def dimensionless(self, uspec):
+        # geopotential perturbation relative to background
+        uspec[0]  = (uspec[0] - self.havg * self.gravity) \
+                    / self.hamp / self.gravity
+        # vorticity/divergence scaled by sqrt(gH)/a
+        uspec[1:] = uspec[1:] * self.radius / torch.sqrt(self.gravity * self.havg)
+        return uspec
+\end{lstlisting}
+
+\subsection{Tendency: \texttt{dudtspec} (Algorithm 2)}
+
+Each line below matches one step of Algorithm~2.
+
+\begin{lstlisting}
+    def dudtspec(self, uspec):
+        dudtspec = torch.zeros_like(uspec)
+
+        # (line 1) spectral -> grid
+        ugrid  = self.spec2grid(uspec)
+        # (line 2) reconstruct (u,v) from (vrt, div)
+        uvgrid = self.getuv(uspec[1:])
+
+        # (line 3) flux  F = (u,v) * (zeta + f)
+        tmp     = uvgrid * (ugrid[1] + self.coriolis)
+        # (line 4) -> spectral (vrt, div) of F
+        tmpspec = self.vrtdivspec(tmp)
+        dudtspec[2] =  tmpspec[0]      # d_t div
+        dudtspec[1] = -tmpspec[1]      # d_t vrt
+
+        # (line 5) mass flux G = Phi * (u,v)
+        tmp = uvgrid * ugrid[0]
+        tmp = self.vrtdivspec(tmp)
+        dudtspec[0] = -tmp[1]          # d_t Phi
+
+        # (line 6) gradient term  - laplacian( Phi + 0.5 |v|^2 )
+        tmpspec = self.grid2spec(ugrid[0] + 0.5 * (uvgrid[0]**2 + uvgrid[1]**2))
+        dudtspec[2] = dudtspec[2] - self.lap * tmpspec
+
+        return dudtspec
+\end{lstlisting}
+
+\subsection{Initial condition: \texttt{galewsky\_initial\_condition}}
+
+Builds the analytic mid-latitude jet of Galewsky \emph{et al.} (2004),
+adds the optional Gaussian height bump (and noise) and inverts the
+nonlinear balance equation in spectral space.
+
+\begin{lstlisting}
+    def galewsky_initial_condition(self, umax=80., usouth=1/7, unorth=5/14,
+                                   perturb_loc=0.25, perturb_amp=1.,
+                                   noise_level=0):
+        device = self.lap.device
+
+        # (a) southern / northern edge of the jet and the normalisation
+        phi0 = torch.asarray(torch.pi * usouth, device=device)
+        phi1 = torch.asarray(torch.pi * unorth, device=device)
+        phi2 = perturb_loc * torch.pi
+        en   = torch.exp(torch.asarray(-4.0 / (phi1 - phi0)**2, device=device))
+        alpha, beta = 1./3., 1./15.
+
+        lats, lons = torch.meshgrid(self.lats, self.lons)
+
+        # (b) zonal jet velocity u1 supported on (phi0, phi1)
+        u1    = (umax/en) * torch.exp(1./((lats-phi0)*(lats-phi1)))
+        ugrid = torch.where(torch.logical_and(lats < phi1, lats > phi0),
+                            u1, torch.zeros(self.nlat, self.nlon, device=device))
+        vgrid = torch.zeros((self.nlat, self.nlon), device=device)
+
+        # (c) optional Gaussian noise + localised height bump
+        if noise_level > 0:
+            noise = noise_level * torch.randn(self.nlat, self.nlon, device=device)
+        else:
+            noise = torch.zeros(self.nlat, self.nlon, device=device)
+
+        hbump = noise + self.hamp * perturb_amp \
+                * torch.cos(lats) \
+                * torch.exp(-((lons-torch.pi)/alpha)**2) \
+                * torch.exp(-(phi2-lats)**2/beta)
+
+        # (d) wind -> (vrt, div) spectral
+        ugrid       = torch.stack((ugrid, vgrid))
+        vrtdivspec  = self.vrtdivspec(ugrid)
+        vrtdivgrid  = self.spec2grid(vrtdivspec)
+
+        # (e) nonlinear balance to obtain geopotential
+        tmp         = ugrid * (vrtdivgrid[:1] + self.coriolis)
+        tmpspec     = self.vrtdivspec(tmp)
+        tmpspec[1]  = self.grid2spec(0.5 * torch.sum(ugrid**2, dim=0))
+        phispec     = self.invlap*tmpspec[0] - tmpspec[1] \
+                      + self.grid2spec(self.gravity*(self.havg + hbump))
+
+        # (f) assemble state vector [Phi, vrt, div] in spectral space
+        uspec      = torch.zeros(3, self.lmax, self.mmax,
+                                 dtype=vrtdivspec.dtype, device=device)
+        uspec[0]   = phispec
+        uspec[1:]  = vrtdivspec
+        return torch.tril(uspec)
+\end{lstlisting}
+
+\subsection{Time integration: \texttt{timestep} (Algorithm 1, loop body)}
+
+This routine performs the third-order Adams--Bashforth update with
+forward-Euler / AB2 bootstrap and the implicit hyperdiffusion step.
+
+\begin{lstlisting}
+    def timestep(self, uspec, nsteps):
+        # storage for tendencies at the three relevant time levels
+        dudtspec = torch.zeros(3, 3, self.lmax, self.mmax,
+                               dtype=uspec.dtype, device=uspec.device)
+        inew, inow, iold = 0, 1, 2
+
+        for iter in range(nsteps):
+            # ---- evaluate RHS ----
+            dudtspec[inew] = self.dudtspec(uspec)
+
+            # ---- bootstrapping: forward Euler, then AB2, then AB3 ----
+            if iter == 0:
+                dudtspec[inow] = dudtspec[inew]
+                dudtspec[iold] = dudtspec[inew]
+            elif iter == 1:
+                dudtspec[iold] = dudtspec[inew]
+
+            # ---- AB3 update ----
+            uspec = uspec + self.dt * (
+                  (23./12.) * dudtspec[inew]
+                - (16./12.) * dudtspec[inow]
+                + ( 5./12.) * dudtspec[iold] )
+
+            # ---- implicit hyperdiffusion on vrt, div ----
+            uspec[1:] = self.hyperdiff * uspec[1:]
+
+            # ---- cyclic permutation of time-level pointers ----
+            inew = (inew - 1) % 3
+            inow = (inow - 1) % 3
+            iold = (iold - 1) % 3
+
+        return uspec
+\end{lstlisting}
+
+\subsection{Driver: \texttt{main}}
+
+The driver instantiates the solver, sweeps over an ensemble of
+Galewsky parameters, integrates for $30$~days, and saves snapshots
+every $30$~minutes.  Only the essential lines are reproduced here.
+
+\begin{lstlisting}
+def main():
+    nlat = 120; nlon = 2*nlat
+    lmax = ceil(64); mmax = lmax
+
+    dt = 150                          # seconds
+    save_interval = int(1800/dt)      # snapshot every 30 min
+    nday = 15 * 2                     # 30 days
+
+    swe_solver = ShallowWaterSolver(nlat, nlon, dt,
+                                    lmax=lmax, mmax=mmax).to(device)
+
+    cache_path = '/data/keeling/a/warrenh2/galewsky_simulations/' \
+                 '120x240_galewsky_cache/'
+    os.makedirs(cache_path, exist_ok=True)
+
+    # Parameter sweep ranges (centred about the canonical Galewsky values)
+    umax_list        = [80. + i1 * 20         for i1 in range(-3, 3)]
+    usouth_list      = [1/7  + i2 * 1/36.     for i2 in range(-2, 3)]
+    unorth_list      = [5/14 + i2 * 1/36.     for i2 in range(-2, 3)]
+    perturb_loc_list = [0.25 + i3 * 1/18.     for i3 in range(-2, 4)]
+    perturb_amp_list = [1.   + i4 * 0.5       for i4 in range(-2, 3)]
+    noise_level_list = [0]            # noise disabled (prof. request)
+
+    i1 = 0; umax = umax_list[i1]
+    for i2, usouth in enumerate(usouth_list):
+        unorth = unorth_list[i2]
+        for i3, perturb_loc in enumerate(perturb_loc_list):
+            for i4, perturb_amp in enumerate(perturb_amp_list):
+                for i5, noise_level in enumerate(noise_level_list):
+                    filename = f'{i1}{i2}{i3}{i4}{i5}.pkl'
+                    filepath = os.path.join(cache_path, filename)
+                    if os.path.exists(filepath):
+                        continue
+
+                    # ---- (1) initial condition ----
+                    uspec0 = swe_solver.galewsky_initial_condition(
+                        umax=umax, usouth=usouth, unorth=unorth,
+                        perturb_loc=perturb_loc, perturb_amp=perturb_amp,
+                        noise_level=noise_level)
+
+                    # ---- (2) time integration & snapshotting ----
+                    data_list = []
+                    for i in range(24*nday + 1):
+                        data_list.append(uspec0.cpu())
+                        uspec0 = swe_solver.timestep(uspec0, save_interval)
+
+                    # ---- (3) save trajectory ----
+                    tensor_save = torch.stack(data_list)
+                    torch.save(tensor_save, filepath)
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\medskip
+\noindent\textbf{Mapping back to the algorithm.}
+The constructor performs the precompute step of Algorithm~1.
+\texttt{galewsky\_initial\_condition} builds $\bvec{U}^{0}$.
+\texttt{dudtspec} is Algorithm~2, evaluated inside the time loop of
+\texttt{timestep}, which implements the AB3 update and hyperdiffusion
+of Algorithm~1.  \texttt{main} simply iterates the solver over the
+ensemble of Galewsky parameters and writes the resulting trajectories
+to disk.
+
+%==============================================================
+\section{Contour Advective Semi-Lagrangian (CASL) Method}
+%==============================================================
+
+The pseudo-spectral solver of Section~2 evaluates Eulerian flux
+divergences on a fixed grid and relies on hyperdiffusion to damp the
+unresolved cascade of potential-vorticity variance.  CASL takes the
+opposite stance: PV is represented by a collection of Lagrangian
+\emph{contours} which are simply advected by the local wind.  The
+inviscid PV conservation law $Dq/Dt = 0$ is then exact along
+trajectories, sharp PV fronts (such as the Galewsky jet's edge) survive
+indefinitely, and no explicit dissipation is needed.
+
+\subsection{The CASL state and the two-grid idea}
+
+CASL carries two complementary representations of the flow at all
+times:
+\begin{itemize}
+    \item a set of \emph{PV level sets},
+          $\mathcal{C} = \{C_{1},\dots,C_{K}\}$, where each contour
+          $C_{k}$ encloses the region $\{q > q_{k}\}$ for a prescribed
+          PV value $q_{k}$ (the contours discretise the range of $q$ at
+          spacing $\Delta q$);
+    \item a coarse \emph{inversion grid} on which $(u,v,\Phi)$ are
+          reconstructed at each step by solving the PV inversion
+          problem.
+\end{itemize}
+Between inversion calls the contours move purely Lagrangianly; between
+contour-advection calls the wind is held fixed.  A periodic
+\emph{contour surgery} step removes filaments thinner than a user-set
+threshold and reconnects pinched contours.
+
+\subsection{PV inversion on the sphere}
+
+Given the PV field $q$ and the mean depth $\bar h$, the auxiliary
+quantities are reconstructed by solving, at each step,
+\begin{equation}
+    (\zeta + f) \;=\; q\,h,
+    \qquad
+    \nabla^{2}\psi \;=\; \zeta,
+    \qquad
+    \nabla^{2}\chi \;=\; \delta,
+    \qquad
+    \bvec{v} \;=\; \hat{\bvec{k}}\!\times\!\nabla\psi + \nabla\chi,
+    \label{eq:pvinv}
+\end{equation}
+together with a balance relation that closes the system (e.g.\ linear
+balance $\nabla^{2}\Phi = \nabla\!\cdot\!(f\bvec{v})$, or
+nonlinear/quasi-geostrophic balance).  Each Poisson solve in
+\eqref{eq:pvinv} is diagonal in spherical harmonics by
+\eqref{eq:lap-diag}, so we re-use the SHT machinery of Section~2 even
+though the time stepping has changed completely.
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{CASL on the sphere for the inviscid shallow-water equations.}
+\begin{algorithmic}[1]
+\State \textbf{Input:} initial PV field $q^{0}(\lambda,\phi)$, mean
+        depth $\bar h$, Coriolis $f$, time step $\Delta t$,
+        contour spacing $\Delta q$, surgery threshold
+        $\ell_{\min}$, number of steps $N$.
+\State \textbf{Initialise contours.}
+        Choose PV levels $q_{k} = q_{\min} + k\,\Delta q$;
+        extract isolines of $q^{0}$ at each $q_{k}$ to obtain
+        $\mathcal{C}^{0} = \{C_{1},\dots,C_{K}\}$.
+\State \textbf{Precompute (as in Section 2):}
+        SHT and inverse SHT,
+        Laplacian eigenvalues $-\ell(\ell+1)/a^{2}$,
+        Coriolis field, balance operator.
+\For{$n = 0,1,\dots,N-1$}
+    \State \textbf{(a)} Render contours $\mathcal{C}^{n}$ onto the
+        inversion grid:
+        $q^{n}(\lambda_{i},\phi_{j})
+            = q_{\min} + \Delta q\,\#\{C_{k}: (\lambda_{i},\phi_{j})\in
+            \mathrm{int}(C_{k})\}$.
+    \State \textbf{(b) PV inversion.}
+        With $h^{n}$ from the previous step (or $\bar h$ at $n=0$),
+        compute $\zeta^{n} = q^{n} h^{n} - f$;
+        spectrally invert $\nabla^{2}\psi = \zeta^{n}$,
+        $\nabla^{2}\chi = \delta^{n}$;
+        update $h^{n}$ from the chosen balance relation;
+        reconstruct $\bvec{v}^{n} = \hat{\bvec{k}}\!\times\!\nabla\psi
+        + \nabla\chi$ via the inverse vector SHT.
+    \State \textbf{(c) Advect contour nodes.}
+        For every node $\bvec{x}_{p}\in\mathcal{C}^{n}$ on every
+        contour, integrate
+        $\dot{\bvec{x}}_{p} = \bvec{v}^{n}(\bvec{x}_{p})$
+        for a step $\Delta t$ using a semi-Lagrangian /
+        third-order Runge--Kutta scheme; interpolate
+        $\bvec{v}^{n}$ to $\bvec{x}_{p}$ from the inversion grid.
+    \State \textbf{(d) Node redistribution.}
+        Insert new nodes along contour arcs whose curvature times
+        local spacing exceeds a tolerance; remove nodes where the
+        spacing is too small.
+    \State \textbf{(e) Contour surgery (every $n_{\mathrm{surg}}$
+        steps).}
+        Detect contour segments closer than $\ell_{\min}$ and
+        reconnect them; delete closed loops with perimeter
+        $<\ell_{\min}$.
+    \State $\mathcal{C}^{n+1} \gets$ the updated contour set.
+\EndFor
+\State \textbf{Return} $\mathcal{C}^{N}$ and the corresponding gridded
+        fields $(q^{N},\zeta^{N},\delta^{N},\Phi^{N},\bvec{v}^{N})$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Inversion sub-routine}
+
+\begin{algorithm}[H]
+\caption{\texttt{pv\_invert}: $(q,\bar h)\mapsto (\bvec{v},\Phi,\zeta,\delta)$.}
+\begin{algorithmic}[1]
+\State Initialise $h \gets \bar h$, $\delta \gets 0$.
+\Repeat
+    \State $\zeta \gets q\,h - f$
+        \Comment{from $q=(\zeta+f)/h$}
+    \State $\hat\zeta \gets \texttt{SHT}(\zeta)$,
+           $\hat\delta \gets \texttt{SHT}(\delta)$
+    \State $\hat\psi_{\ell m} \gets -a^{2}/[\ell(\ell+1)]\,\hat\zeta_{\ell m}$
+        \Comment{$\ell=0$ mode zeroed}
+    \State $\hat\chi_{\ell m} \gets -a^{2}/[\ell(\ell+1)]\,\hat\delta_{\ell m}$
+    \State $\bvec{v} \gets \texttt{iVSHT}(\hat\zeta,\hat\delta)$
+        \Comment{equivalent to \texttt{getuv}}
+    \State Update $\Phi$ from balance, e.g.\ solve
+           $\nabla^{2}\Phi = \nabla\!\cdot\!(f\bvec{v})
+           - \nabla^{2}\!\bigl[\tfrac{1}{2}|\bvec{v}|^{2}\bigr]$
+           spectrally (one diagonal divide).
+    \State $h \gets \Phi/g$
+\Until{$\|h^{(k+1)} - h^{(k)}\| < \varepsilon$}
+\State \textbf{Return} $(\bvec{v},\Phi,\zeta,\delta)$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Where the SHT still pays off}
+
+Even though there is no explicit Eulerian flux divergence, hyperdiffusion,
+or grid-based PV tendency, every step of CASL contains an elliptic
+inversion (lines (b) of Algorithm~3 and the whole of Algorithm~4) of
+the form $\nabla^{2}\phi = s$.  By \eqref{eq:lap-diag} this becomes one
+multiplication per spectral mode, costing $O(N^{2})$ once the transform
+itself has been applied.  Concretely the SHT contributes:
+\begin{enumerate}
+    \item Poisson solves for $\psi,\chi$ from $(\zeta,\delta)$;
+    \item one extra diagonal divide for the balance equation that
+          provides $\Phi$ (and hence $h$);
+    \item the vector inverse SHT that turns
+          $(\hat\zeta,\hat\delta)$ directly into $(u,v)$ via vector
+          spherical harmonics --- the same operation used by
+          \texttt{getuv} in Section~3;
+    \item natural handling of the pole: SHT eliminates the
+          $1/\cos\phi$ singularity that haunts lat-lon
+          finite-difference or multigrid Poisson solvers.
+\end{enumerate}
+What CASL removes is exactly what was \emph{not} diagonal in the SH
+basis to begin with: the nonlinear advection of $q$ (now done by
+following contours) and the dissipation needed to keep that advection
+stable (no longer needed because contour surgery, not diffusion,
+controls the cascade).  The SHT is therefore narrowly but firmly
+useful: it is the workhorse of the elliptic inversion step --- the one
+linear operation in CASL that genuinely benefits from spectral
+diagonalisation.
+
+\end{document}
