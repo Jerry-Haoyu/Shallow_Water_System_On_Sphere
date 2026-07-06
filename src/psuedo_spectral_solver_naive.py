@@ -22,7 +22,7 @@ class ShallowWaterSolver(AbstractSWSolver):
     1. uspec is frequency of (ɸ,𝛇,δ)
     """
 
-    def __init__(self, dt, nlat=120, nlon=240, damp_efold=2, lmax=None, mmax=None, grid="equiangular"):
+    def __init__(self, dt, nlat=120, nlon=240, tau=2, lmax=None, mmax=None, grid="equiangular"):
         super().__init__(dt)
 
         # time stepping param
@@ -68,8 +68,8 @@ class ShallowWaterSolver(AbstractSWSolver):
         coriolis = 2 * self.omega * torch.sin(lats).reshape(self.nlat, 1)
 
         # hyperdiffusion
-        self.damp_efold = damp_efold
-        hyperdiff = torch.exp(torch.asarray((-self.dt / self.damp_efold/ 3600.)*(lap / lap[-1, 0])**4))
+        self.tau = tau
+        hyperdiff = torch.exp(torch.asarray((-self.dt / self.tau/ 3600.)*(lap / lap[-1, 0])**4))
 
         # register all
         self.register_buffer('lats', lats)
@@ -145,12 +145,17 @@ class ShallowWaterSolver(AbstractSWSolver):
 
         tmp = uvgrid * (ugrid[1] + self.coriolis)
         tmpspec = self.vrtdivspec(tmp)
-        dudtspec[2] = tmpspec[0]
-        dudtspec[1] = -1 * tmpspec[1]
+        # divergence
+        dudtspec[2] = tmpspec[0]  # R.H.S vort_spec
+        
+        # vorticity
+        dudtspec[1] = -1 * tmpspec[1] # R.H.S - div_spec
 
         tmp = uvgrid * ugrid[0]
         tmp = self.vrtdivspec(tmp)
-        dudtspec[0] = -1 * tmp[1]
+        
+        # geopotential
+        dudtspec[0] = -1 * tmp[1] # R.H.S div_spec
 
         tmpspec = self.grid2spec(ugrid[0] + 0.5 * (uvgrid[0]**2 + uvgrid[1]**2))
         dudtspec[2] = dudtspec[2] - self.lap * tmpspec
@@ -273,6 +278,42 @@ class ShallowWaterSolver(AbstractSWSolver):
         number_of_frames = int(1 + np.ceil(total_steps / step_per_save))
         print(f" Simulating SWE on Sphere for {days} days (Naive Psuedo-Spectral Solver)")
         print(f" Total frames = {number_of_frames} | Time per frame = {step_per_save * self.dt /3600} (h)")
+       
+        # 1. Compute raw, physical Potential Vorticity (SI units: 1 / (m * s))
+        ugrid = self.spec2grid(uspec)
+        phi_physical = ugrid[0] # gh (m^2/s^2)
+        h_physical = phi_physical / self.gravity # h (m)
+        vrt_physical = ugrid[1] # zeta (1/s)
+        
+        q_physical = (vrt_physical + self.coriolis) / h_physical # (1 / (m * s))
+        q_ref_physical = self.coriolis / self.havg               # (1 / (m * s))
+        
+        # 2. Compute the characteristic anomaly frequency scale (1/s)
+        # This matches Dritschel's numerator: h_avg * max|q - q_ref|
+        pv_anomaly_max = torch.max(torch.abs(q_physical - q_ref_physical))
+        vrt_scale_dritschel = self.havg * pv_anomaly_max # Units: 1/s
+        
+        # 3. Handle the spatial scaling matching your dimensional Laplacian
+        lambda_max_power_n = (self.lap[-1, 0]) ** 4 # Units: m^-8
+        
+        # 4. Compute recommended physical hyperviscosity nu (m^8/s)
+        nu_recommend = vrt_scale_dritschel / lambda_max_power_n
+        
+        # 5. Convert this directly to your model's e-folding timescale tau (in hours)
+        # At the grid limit, e-fold time in seconds is 1 / (nu * lambda_max^4)
+        tau_recommend_seconds = 1.0 / (nu_recommend * lambda_max_power_n)
+        tau_recommend_hours = tau_recommend_seconds / 3600.0
+        
+        # print out in a box
+        title_text = f" Hyperdiffusion "
+        criteria_text = f"(Dritschel 1997 Criteria):  ν = {nu_recommend.item():.3e} m^8/s | Equivalent e-fold time = {tau_recommend_hours.item():.3f} hours"
+        actual_hyerdiffusion_text = f"Actual model e-fold time = {self.tau:.3f} hours" 
+        end_text = '-'*98
+        print(f"+{title_text.center(98, '-')}+", end='\n')
+        print(f"|{criteria_text.center(98)}|", end='\n')
+        print(f"|{actual_hyerdiffusion_text.center(98)}|", end='\n')
+        print(f"+{end_text.center(98)}+", end='\n')
+        
         with torch.no_grad():
             for i in tqdm.trange(number_of_frames, desc=f'Simulation in Progrgess'):
                 frames.append(uspec.cpu())
