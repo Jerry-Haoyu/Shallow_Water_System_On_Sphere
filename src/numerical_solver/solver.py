@@ -5,11 +5,12 @@ import torch.nn as nn
 # inherit from nn.Module to allow easy .to(device)
 class AbstractSWSolver(ABC, nn.Module):
     @abstractmethod
-    def __init__(self, dt):
+    def __init__(self):
         super().__init__()
         
-        # store constants 
-        self.dt = dt
+        # Note this does not move the model actually to device, 
+        # which should be done outside after instantiation
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # physical sonstants
         self.register_buffer('radius', torch.as_tensor(6.37122E6, dtype=torch.float64))

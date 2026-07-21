@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import tqdm
 
-from psuedo_spectral_solver_naive import ShallowWaterSolver
+from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 
 # variable name -> (human-readable label, default colormap).
 # Aliases map onto the same physical field.
@@ -27,14 +27,14 @@ _VAR_INFO = {
 
 def _solver_from_metadata(metadata):
     """Rebuild a solver from saved metadata so we can map spectral -> grid."""
-    return ShallowWaterSolver(
-        dt=metadata["dt"],
-        nlat=metadata["nlat"],
-        nlon=metadata["nlon"],
+    # Resolution is fully determined by lmax (mmax=lmax, nlat=2*lmax, nlon=2*nlat) and dt
+    # is derived from CFL — neither is needed from metadata for reconstruction.
+    solver = ShallowWaterSolver(
         lmax=metadata["lmax"],
-        mmax=metadata["mmax"],
         grid=metadata.get("grid", "equiangular"),
     )
+    solver.to(solver.device)
+    return solver
 
 
 def _field_from_uspec(solver, uspec, var, _cache):
@@ -72,23 +72,56 @@ def _field_from_uspec(solver, uspec, var, _cache):
     )
 
 
-def _build_var_video(solver, trajectory, var):
-    """Convert the whole spectral trajectory into a list of grid frames for `var`."""
+def _coarsen_view(solver, trajectory, factor):
+    """Build a lower-resolution solver and spectrally truncate the trajectory so
+    fields can be reconstructed on a coarse grid — the inverse SHT then runs over
+    far fewer grid points and modes. Returns (coarse_solver, truncated_trajectory).
+    """
+    # Truncating the spectral resolution by `factor` automatically coarsens the grid
+    # too (the solver derives nlat = 2*lmax, nlon = 2*nlat), so the inverse SHT runs
+    # over far fewer modes and grid points.
+    lmax_c = max(4, solver.lmax // factor)
+    coarse = ShallowWaterSolver(lmax=lmax_c, grid=solver.grid)
+    coarse = coarse.to(trajectory.device)
+    traj_c = trajectory[:, :, :lmax_c, :lmax_c].contiguous()
+    return coarse, traj_c
+
+
+def _build_var_video(solver, trajectory, var, spatial_coarsen=1, temporal_stride=1):
+    """Convert the spectral trajectory into a list of grid frames for `var`.
+
+    spatial_coarsen : reconstruct on a grid coarsened by this integer factor (>1
+                      is much faster; fields are spectrally truncated to match).
+    temporal_stride : reconstruct only every N-th frame (skips work for frames
+                      that won't be displayed).
+    """
+    if temporal_stride and temporal_stride > 1:
+        trajectory = trajectory[::temporal_stride]
+    if spatial_coarsen and spatial_coarsen > 1:
+        solver, trajectory = _coarsen_view(solver, trajectory, spatial_coarsen)
+    # Reconstruct on whatever device the solver lives on. The trajectory can stay on
+    # the CPU (e.g. an mmap'd multi-GB file); only the small per-frame spectral slice
+    # (~few MB) is moved to the solver's device, so a GPU solver accelerates the inverse
+    # SHT without ever holding the whole trajectory in GPU memory.
+    dev = solver.lap.device
     video = []
     with torch.no_grad():
-        for t in range(trajectory.shape[0]):
-            field = _field_from_uspec(solver, trajectory[t], var, _cache={})
+        for t in tqdm.trange(trajectory.shape[0], desc=f"Reconstructing {var}"):
+            field = _field_from_uspec(solver, trajectory[t].to(dev), var, _cache={})
             video.append(field.detach().cpu().numpy())
     return video
 
-def get_var_field(data_path, var):
+def get_var_field(data_path, var, device="cpu"):
     """
-    Given the path of the data, return the grid and the the a list of gridded frames for 'var' 
+    Given the path of the data, return the grid and the the a list of gridded frames for 'var'
         (X, Y, [Z_t]t)
+    `device` controls where the inverse-SHT reconstruction runs ("cuda" is much
+    faster for large lmax); frames are returned as CPU numpy arrays regardless.
     """
     data = torch.load(data_path, map_location="cpu", weights_only=False)
     metadata = data['metadata']
-    solver = _solver_from_metadata(metadata)
-    video = _build_var_video(solver, data['trajectory'], var)
+    solver = _solver_from_metadata(metadata).to(device)
+    trajectory = data['trajectory'].to(device)
+    video = _build_var_video(solver, trajectory, var)
     print(f"Returning a tuple  (X, Y, [Z_i]_i) where X=lons, Y=lats and Z is {var} \n  i ⊂ [1, {len(video)} | dt = {metadata['dt']}] | Shape = {video[0].shape} ")
-    return solver.lons, solver.lats, video
+    return solver.lons.detach().cpu(), solver.lats.detach().cpu(), video
