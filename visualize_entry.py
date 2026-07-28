@@ -1,4 +1,4 @@
-from src.visualization.visualization import (
+from src.analyze.visualization import (
     animate_swe_on_box,
     animate_swe_on_sphere,
     visualize_initial_condition_on_sphere,

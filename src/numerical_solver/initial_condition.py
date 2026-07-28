@@ -96,8 +96,11 @@ def rw_initial_condition(model, netcdf_path, ic_time, balanced=True):
     # open the data set and average along the pressure level axis
     ds = (xr.open_dataset(netcdf_path))
     
-    # select the date
-    ds = ds.sel(time=ic_time, method='nearest')
+    # select the date. squeeze() drops any leftover length-1 dims (e.g. a
+    # single-pressure-level download keeps a `pressure_level` dim of size 1
+    # that a pre-averaged multi-level file wouldn't have) so u/v always come
+    # back as plain (latitude, longitude) regardless of which kind of file this is.
+    ds = ds.sel(valid_time=ic_time, method='nearest').squeeze()
     data_finish_time = time.perf_counter()
     print(f"    Finished preparing data in {data_finish_time - start_time:.6f} seconds")
     

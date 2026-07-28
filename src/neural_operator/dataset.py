@@ -15,22 +15,18 @@ class SWEDataset(torch.utils.data.Dataset):
     ``{'metadata': {...}, 'trajectory': tensor}`` where ``trajectory`` has shape
     ``(frames, 3, lmax, mmax)`` of spectral coefficients.
 
-    All files are assumed to share the same solver configuration, so the solver
-    used to map spectral coefficients back to the grid is rebuilt exactly once in
-    ``__init__`` from the stored metadata. The behaviour is fixed to the common
-    training setup: normalization is always on, the sampling window covers the
-    whole trajectory, a random start step is drawn per sample, and inputs are the
-    spectral-to-grid fields (``spec2grid``). The normalization statistics are
-    computed in place from the data during construction.
+    All files are assumed to share the same solver configuration
     """
 
     def __init__(self, simulation_data_dir, n_future):
         self.simulation_data_dir = simulation_data_dir
         self.nfuture = n_future
 
-        # fixed behaviour (previously configurable)
-        self.normalize = True
+        # normalize training data by doing a Z-score like transformation
+        self.normalize = True 
+        # Pick starting opint randomly
         self.random_flag = True
+        # Store trajectories type: either 'spec' or 'physical'
         self.input_type = "spec"
 
         # every trajectory file in the directory forms the sample pool
@@ -55,6 +51,7 @@ class SWEDataset(torch.utils.data.Dataset):
         # step_window spans the whole trajectory: any start step whose n_future
         # target still lands inside the trajectory. Inferred from its length.
         n_frames = first["trajectory"].shape[0]
+        print(f"💿 SWE Dataset: Each trajectory has n_frames={n_frames} ")
         self.step_window = (0, n_frames - 1 - self.nfuture)
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(
@@ -112,10 +109,12 @@ class SWEDataset(torch.utils.data.Dataset):
             uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
 
         # pick a random starting step within the whole-trajectory window
-        self.step_srt = random.randint(self.step_window[0], self.step_window[1])
-        self.step_end = self.step_srt + self.nfuture
+        step_start = random.randint(self.step_window[0], self.step_window[1])
+        step_end = step_start + self.nfuture
+        # print(f"Picking trajectory number {index} ")
+        # print(f"step_start = {step_start}, step_end = {step_end}")
 
-        uspec_target = uspec[self.step_srt: self.step_end + 1]
+        uspec_target = uspec[step_start: step_end + 1]
 
         # first and last steps - convert based on input_type
         inp = self._spec_to_grid(uspec_target[0].to(self.device)).float()
@@ -125,4 +124,4 @@ class SWEDataset(torch.utils.data.Dataset):
             inp = (inp - self.inp_mean) / self.inp_std
             tar = (tar - self.inp_mean) / self.inp_std
 
-        return inp.clone(), tar.clone(), (index, self.step_srt)
+        return inp.clone(), tar.clone(), (index, step_start)

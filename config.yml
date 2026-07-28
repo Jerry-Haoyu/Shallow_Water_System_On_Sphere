@@ -1,0 +1,116 @@
+# configuration for make run_solver
+run_solver:
+  # solver / resolution configuration
+  lmax: 64
+  tau: [30000, 30, 40]
+  cfl: 0.25
+  grid: "equiangular"          # equiangular | legendre-gauss | lobatto
+  semi_implicit: True
+  dealias: False
+  # simulation
+  duration: 10                # days
+  save_interval_minutes: 30
+  # initial condition
+  ic: "real_world"               # galewsky | real_world
+  netcdf_path: "reanalysis_data/2026_07_(100,1000)hPa.nc"            # required when ic == real_world
+  ic_time: "2026-07-05T00:00:00"                   # required when ic == real_world, e.g. 2000-07-01T00:00:00
+  pressure: "(100,1000)"               # required when ic == real_world (for naming), e.g. 500
+  checkpoint_only: False       # only initialize + save the solver checkpoint
+
+# configuration for make batch_simulation (one run_solver job per netcdf time point)
+batch_simulation:
+  # data / time selection
+  netcdf_path: "reanalysis_data/2000_2025_odd_months_(100,1000).nc"
+  time_dim: "time"
+  engine: null                # xarray engine (e.g. cfgrib for grib); null = auto-detect
+  stride: 1                   # use every Nth time point
+  limit: null                 # only submit the first N (post-stride) time points
+  # solver configuration, forwarded into each job's own run_solver.py config
+  lmax: 64
+  tau: [30000, 30000, 30]
+  cfl: 0.25
+  grid: "equiangular"          # equiangular | legendre-gauss | lobatto
+  semi_implicit: True
+  dealias: True
+  duration: 20                 # days
+  save_interval_minutes: 30
+  pressure: "(100,1000)"       # required (for naming), e.g. 500
+  # slurm knobs
+  partition: "gpu"
+  account: "gzhang13-group"
+  time_limit: "12:00:00"
+  gres: "gpu:1"                # "" to omit (CPU-only)
+  mem: "32G"
+  cpus: 4
+  job_name_prefix: "swe_rw"
+  python: "/data/gzhang13/a/hytang2/envs/swe/bin/python"
+  script_dir: "slurm_scripts"
+  config_dir: "slurm_scripts/configs"
+  log_dir: "slurm_logs"
+  dry_run: False
+
+# configuration for make inference (neural-operator rollout)
+inference:
+  # which trained model (locates the checkpoint via the convention)
+  nlat: 128
+  nlon: 256
+  n_future: 2
+  num_layers: 5
+  embed_dim: 256
+  pos_embed: "learnable lat"
+  trainData: "2000_2025_odd_months_(100,1000)"
+  grid: "equiangular"          # equiangular | legendre-gauss | lobatto
+  index: 0                     # 0/, 1/, ... training-config slot
+  single_step: True
+  # rollout
+  duration: 3                # days
+  save_interval_minutes: 60
+  # initial condition
+  ic: "real_world"               # galewsky | real_world
+  netcdf_path: "reanalysis_data/2000_2025_odd_months_(100,1000).nc"            # required when ic == real_world
+  ic_time: "2025-07-01T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
+  pressure: "(100,1000)"               # required when ic == real_world (for naming), e.g. 500
+
+# configuration for make train_single
+train_single:
+  training_data_dir: "model_output/training_data/2000_2025_odd_months_(100,1000)"
+  batch_size: 32
+  lr: 1e-4
+  n_future: 2
+  # model architecture
+  num_layers: 5          # number of SFNO layers
+  # scale_factor must stay 1 when pos_embed != "none": torch_harmonics's SFNO
+  # applies pos_embed at full img_size resolution (before any downsampling
+  # happens inside the SFNO blocks), but builds the embedding buffer at the
+  # *downsampled* (scale_factor>1) resolution 
+  scale_factor: 1          # downsampling ratio
+  embed_dim: 256            # up-projection from 3 channels
+  pos_embed: "learnable lat"  # positional embedding before SFNO layers
+  epochs: 300
+  weight_decay: 0.01
+  validation_cadence: 25
+  warmup_epochs: 5
+  warmup_start_factor: 0.001 
+  restart: True
+  restart_period: 10
+  restart_mult: 2
+  compile: False
+  # if true, search 0/, 1/, ... for a run with this same architecture (training
+  # hyperparameters need not match) and continue training it; if false, always
+  # start a brand new run from scratch.
+  continue: True
+
+download_era5:
+  save_path: "reanalysis_data/2026_07_(100,1000)hPa.nc" 
+  year_start: 2026
+  year_end: 2026
+  months: [7]
+  day_start : 5
+  day_end: 10
+  time_option: "midnight" # ["midnight", "all"]
+  pressure_level_start: 100
+  pressure_level_end: 1000
+  vertical_integration: True 
+
+track_cyclone:
+  

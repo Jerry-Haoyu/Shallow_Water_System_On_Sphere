@@ -1,7 +1,19 @@
+"""
+Numerous visualization APIs for SWE simulation data
+
+@author Haoyu Tang hytang2@illinois.edu
+"""
+import sys
+from pathlib import Path
+SRC_DIR = Path(__file__).resolve().parent.parent.parent  # Adjust .parent steps as needed
+sys.path.insert(0, str(SRC_DIR))
+
 import os
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
+from matplotlib.ticker import AutoMinorLocator, MultipleLocator
+
 import numpy as np
 import torch
 import tqdm
@@ -11,7 +23,7 @@ import matplotlib.animation as animation
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-from src.visualization.data import _solver_from_metadata, _field_from_uspec, _build_var_video
+from src.analyze.data import _solver_from_metadata, _field_from_uspec, _build_var_video
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 
 # variable name -> (human-readable label, default colormap).
@@ -50,10 +62,8 @@ def _common_setup(data, device="cpu"):
     lats = solver.lats.detach().cpu().numpy()
     lons = solver.lons.detach().cpu().numpy()
 
-    # physical seconds advanced per saved frame (step_per_save may be absent on
-    # older save files, in which case titles fall back to the frame index).
     step_per_save = metadata.get("step_per_save")
-    sec_per_frame = metadata["dt"] * step_per_save if step_per_save else None
+    sec_per_frame = metadata["save_interval_minutes"] * 60 
 
     return solver, trajectory, lats, lons, sec_per_frame
 
@@ -67,7 +77,7 @@ def _frame_title(label, frame_idx, coarsen_factor, sec_per_frame):
 
 
 def _color_limits(video):
-    sample = video[:: max(1, len(video) // 20)]
+    sample = video[0]
     all_vals = np.concatenate([v.ravel() for v in sample])
     return float(np.percentile(all_vals, 2)), float(np.percentile(all_vals, 98))
 
@@ -208,11 +218,7 @@ def animate_swe_on_box(data, variables, output_dir, fps=15, coarsen_factor=1,
         output_path = os.path.join(output_dir, f"{var}.mp4")
         print(f" Animating {var} on box -> {output_path}")
 
-        # Coarsen temporally during reconstruction, not just at display time:
-        # `temporal_stride` skips frames so they're never reconstructed or held in the
-        # video list. This matches the previous displayed animation (every Nth frame at
-        # full resolution) but keeps the list ~coarsen_factor times smaller, which is
-        # what avoids the OOM on large-nframes runs.
+        # Coarsen temporally during reconstruction, not just at display time
         video = [frame[:, lon_order]
                  for frame in _build_var_video(solver, trajectory, var,
                                                temporal_stride=coarsen_factor)]
@@ -228,8 +234,7 @@ def animate_swe_on_box(data, variables, output_dir, fps=15, coarsen_factor=1,
             fig, ax = plt.subplots(subplot_kw={"projection": ccrs.PlateCarree()})
             ax.set_global()
             ax.coastlines(resolution="110m", color="red", linewidth=1)
-            # Origin "lower" so increasing latitude points up; `transform` tells
-            # cartopy the data itself is in PlateCarree lon/lat.
+            # Origin "lower" so increasing latitude points up
             im = ax.imshow(video[0], origin="lower", extent=extent,
                            norm=norm, cmap=cmap, interpolation="bilinear",
                            transform=ccrs.PlateCarree())
@@ -394,7 +399,112 @@ def visualize_initial_condition_on_sphere(
     print(f"Saved initial-condition sphere plot -> {output_path}")
 
 
-def animate_uv_quiver_on_box(data, 
+def plot_sphere_comparison(ref_data, inf_data, var, hours, output_path,
+                           ref_label="Ground Truth", inf_label="Inference",
+                           elev=15, azim=35, figsize=None):
+    """
+    2 x len(hours) grid of ``var`` rendered on the sphere: row 0 from
+    ``ref_data``, row 1 from ``inf_data``, one column per entry of ``hours``.
+    Spheres only - no axis panes, ticks, or grid (the static counterpart to
+    :func:`animate_swe_on_sphere`'s per-frame rendering).
+
+    Parameters
+    ----------
+    ref_data, inf_data : dict {'metadata', 'trajectory'} as written by run().
+                          Frame 0 of each is assumed to already be time-aligned
+                          (e.g. both taken right after any warm-up spin-up) -
+                          ``hours`` is measured from each trajectory's own
+                          frame 0.
+    var                 : variable name (see _VAR_INFO), e.g. 'pv'.
+    hours               : sequence of times (hours since frame 0) to plot as columns.
+    output_path         : where to save the figure.
+    """
+    label, cmap_name = _VAR_INFO.get(var, (var, "coolwarm"))
+    rows = [(ref_label, ref_data), (inf_label, inf_data)]
+    n_cols = len(hours)
+
+    # Reconstruct only the requested frames (not the whole trajectory).
+    fields = {}
+    coords = {}  # row_idx -> (x, y, z) sphere coordinates
+    for row_idx, (_, data) in enumerate(rows):
+        solver, trajectory, lats, lons, sec_per_frame = _common_setup(data)
+        lons_c, lon_order = _center_longitudes(lons)
+
+        Lons, Lats = np.meshgrid(lons_c, lats)
+        x = np.cos(Lats) * np.cos(Lons)
+        y = np.cos(Lats) * np.sin(Lons)
+        z = (296 / 297) * np.sin(Lats)
+        coords[row_idx] = (x, y, z)
+
+        dev = solver.lap.device
+        n_frames = trajectory.shape[0]
+        for col_idx, h in enumerate(hours):
+            frame_idx = int(round(h * 3600.0 / sec_per_frame))
+            if frame_idx >= n_frames:
+                print(f"⚠️  t={h}h (frame {frame_idx}) is past the end of the "
+                      f"'{rows[row_idx][0]}' trajectory ({n_frames} frames); using the last frame.")
+                frame_idx = n_frames - 1
+            with torch.no_grad():
+                field = _field_from_uspec(solver, trajectory[frame_idx].to(dev), var, _cache={})
+            fields[(row_idx, col_idx)] = field.detach().cpu().numpy()[:, lon_order]
+
+    ref_data0 = _field_from_uspec(solver, ref_data['trajectory'][0].to(dev), var, _cache={}).cpu().numpy()
+    vmin, vmax = float(np.percentile(ref_data0, 2)), float(np.percentile(ref_data0, 98)) # normalize color map using only reference data
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap(cmap_name)
+
+    if figsize is None:
+        figsize = (7.0 * n_cols, 14.0)
+    fig, axes = plt.subplots(2, n_cols, figsize=figsize, subplot_kw={"projection": "3d"})
+    axes = np.atleast_2d(axes).reshape(2, n_cols)
+
+    # 3D axes reserve a lot of invisible padding around their data by default,
+    # which is what makes the sphere look small even at a large figsize. Pin
+    # tight cube limits/aspect and pull the subplots close together (negative
+    # wspace/hspace) so each sphere fills nearly its whole cell.
+    lim = 0.65
+    for row_idx, (row_label, _) in enumerate(rows):
+        x, y, z = coords[row_idx]
+        for col_idx, h in enumerate(hours):
+            ax = axes[row_idx, col_idx]
+            ax.plot_surface(
+                x, y, z, zorder=1,
+                facecolors=cmap(norm(fields[(row_idx, col_idx)])),
+                rcount=x.shape[0], ccount=x.shape[1],
+                shade=False, antialiased=False, linewidth=0,
+            )
+            ax.set_box_aspect((1, 1, 1))
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_zlim(-lim, lim)
+            ax.margins(0)
+            ax.set_axis_off()
+            ax.view_init(elev=elev, azim=azim)
+            if row_idx == 0:
+                ax.set_title(f"t = {h:g}h", fontsize=16)
+
+        axes[row_idx, 0].text2D(
+            -0.02, 0.5, row_label, transform=axes[row_idx, 0].transAxes,
+            rotation=90, va="center", ha="center", fontsize=18,
+        )
+
+    fig.subplots_adjust(left=0.03, right=0.92, top=0.90, bottom=0.02,
+                        wspace=0.0, hspace=-0.05)
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6, pad=0.02, label=label)
+    fig.suptitle(f"{label}: {ref_label} vs {inf_label}", fontsize=18)
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"📸 Saved sphere comparison plot -> {output_path}")
+
+
+def animate_uv_quiver_on_box(data,
                              output_dir, 
                              file_name="uv_quiver", 
                              time_coarsen_factor=4):
@@ -404,6 +514,7 @@ def animate_uv_quiver_on_box(data,
     u =  _build_var_video(solver, trajectory, 'u', temporal_stride=time_coarsen_factor)
     v =  _build_var_video(solver, trajectory, 'v', temporal_stride=time_coarsen_factor)
     h =  _build_var_video(solver, trajectory, 'h', temporal_stride=time_coarsen_factor)
+    pv =  _build_var_video(solver, trajectory, 'pv', temporal_stride=time_coarsen_factor)
 
     fig, ax = plt.subplots(figsize=(8, 6), 
                         dpi=150, 
@@ -619,18 +730,68 @@ def animate_spectrum(data,
     ax.set_ylabel(r"Enstropy $\int |\zeta|^2$ ")
     ax.set_title(_frame_title("Energy Spectrum", 0, time_coarsen_factor, sec_per_frame))
     ax.grid(which='minor', linestyle=':', linewidth=0.5, color='gray')
-    
+
     def compute_enstropy(t):
-        vort_spec = trajectory[t][1]
+        vort_spec = trajectory[t][1] # spec(𝛇)
+        if len(vort_spec) != solver.lmax:
+            raise RuntimeError("vort_spec in wrong shape!")
         # apply parsevel's theorem to compute total energy
         enstropy = 2 * np.sum((vort_spec[:, 1:].abs().numpy())**2, axis=1)  + (vort_spec[:, 0].abs().numpy())**2
         return enstropy
-    line, = ax.loglog(np.logspace(1, np.log10(solver.lmax), int((solver.lmax))), compute_enstropy(0))
+
+    x = np.arange(start=1, stop=solver.lmax+1, step=1)
+    y = compute_enstropy(0)
+    spectrum, = ax.loglog(x, y)
+    ax.set_xticks(np.arange(10, 61, step=10))
+    ax.set_xticklabels(np.arange(10, 61, step=10))
+
+    def linear_regression(x, y):
+        intercept_, slope_ = 0, 0
+        best_error = float('inf')
+        best_start = None
+        for start in range(int(0.15 * len(x)), int(0.25 * len(x))):
+            A = np.vstack([x[start:], np.ones_like(x[start:])]).T # coefficient matrix
+            result = np.linalg.lstsq(A,y[start:])
+            slope, intercept = result[0]
+            error = result[1]
+            if error < best_error:
+                intercept_, slope_ = intercept, slope
+                best_error = error 
+                best_start = start
+        return slope_, intercept_, best_error, best_start
+
+    k, b, error, start = linear_regression(np.log(x), np.log(y))
+    ks, bs, errors, starts = [k], [b], [start], [error]
+    # print(f"b={b},k={k}, error={error}, start={start}")
+    best_fit, = ax.plot(x[start:], np.exp(k * np.log(x[start:]) + b), linestyle='dashed')
 
     def animate(i):
+        nonlocal x, ks, bs
         pbar.update(1)
-        line.set_ydata(compute_enstropy(i * time_coarsen_factor))
+        y = compute_enstropy(i * time_coarsen_factor)
+        spectrum.set_ydata(compute_enstropy(i * time_coarsen_factor))
+        k, b, error, start = linear_regression(np.log(x), np.log(y))
+        ks.append(k)
+        bs.append(b)
+        best_fit.set_xdata(x[start:])
+        best_fit.set_ydata(np.exp(k * np.log(x[start:]) + b))
         ax.set_title(_frame_title("Energy Spectrum", i, time_coarsen_factor, sec_per_frame))
         
+    
     ani = animation.FuncAnimation(fig, animate, len(trajectory)//time_coarsen_factor, interval=50)
     ani.save(f"{output_dir}/energy_spectrum.mp4")
+    
+    # plot the variation of line of best fit
+    fig_1, ax_1 = plt.subplots()
+    ax_1.set_title(r"Variation of Line of Best Fit $Z_l = exp(k * log(l) + b)$")
+    ax_1.grid(which='major', linestyle=':', linewidth=1, color='black')
+    ax_1.grid(which='minor', linestyle=':', linewidth=0.5, color='gray')
+    ax_1.set_xlabel("Time (Days)")
+    ticks = np.arange(1,len(ks)+1, step=int(0.1 * (len(ks)+1))).astype(float)
+    ax_1.set_xticks(ticks)
+    ax_1.yaxis.set_minor_locator(AutoMinorLocator(n=2))
+    ax_1.set_xticklabels((ticks * sec_per_frame / 86400 * time_coarsen_factor ).astype(int))
+    ax_1.plot(np.arange(1,len(ks)+1), ks, label=rf"slope $k$")
+    ax_1.plot(np.arange(1,len(bs)+1), bs, label=rf"intercept $b$")
+    plt.legend()
+    fig_1.savefig(f"{output_dir}/variation_of_bf.png")

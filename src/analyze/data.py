@@ -1,3 +1,11 @@
+"""
+Helper functions to for visualization/analysis 
+Primary functions is to preprocess simulated data for visualization 
+
+@author Haoyu Tang hytang2@illinois.edu and Claude 
+"""
+
+
 import os
 
 import numpy as np
