@@ -3,13 +3,16 @@
 Run neural-operator (SFNO) inference and store the rollout following the
 data/model organization convention (README.md). This parallels run_solver.py:
 
-  1. Resolve where the inference trajectory would live per the convention. If
-     it already exists, there is nothing to do.
-  2. Otherwise resolve the trained model directory. Unlike the numerical solver
-     (which can be initialized on the fly) a neural operator must already be
+  1. Resolve the trained model directory. Unlike the numerical solver (which
+     can be initialized on the fly) a neural operator must already be
      trained, so a missing checkpoint is a hard error (train it first).
-  3. Generate the initial condition (grid space) and call run() in
-     src/helpers/run_model.py, which infers and stores the trajectory.
+     Likewise resolve/initialize the reference numerical solver's checkpoint.
+  2. Generate the initial condition (grid space) and call run() in
+     src/helpers/run_model.py for both the SFNO rollout and the reference
+     numerical run. run() derives where each trajectory lives entirely from
+     its own model_checkpoint path (the data tree is isomorphic to the
+     checkpoint tree) plus (duration, ic, ...), and skips the
+     simulation/inference if it's already there.
 
 Configuration is read from the ``inference`` section of config.yml (pass an
 alternative path as the first CLI argument).
@@ -24,28 +27,37 @@ sys.path.insert(0, str(SRC_DIR))
 from pathlib import Path
 from types import SimpleNamespace
 
+import time
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+import xarray as xr
 import yaml
+import tqdm
+import json
+import re
+from torch_harmonics.sht import RealVectorSHT
 
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.numerical_solver.initial_condition import *
-from src.neural_operator.loss import spectral_l2loss_sphere
+from src.neural_operator.loss import LOSS_FUNCTIONS
 from src.analyze.visualization import plot_sphere_comparison
 from src.helpers.run_model import (
     run,
     neural_model_path,
-    neural_data_path,
     numerical_checkpoint_path,
-    numerical_data_path,
+    save_numerical_checkpoint,
+    load_numerical_checkpoint,
+    load_h_stats,
+    physical_to_nondim,
 )
 from src.helpers.print import print_in_box
 
 # Must match the hardcoded spin-up length in run_model.py's neural branch
 # ("Spinning up the initial condition" loop, run_model.py:320).
-SPINUP_DAYS = 1.0
+SPINUP_DAYS = 3.0
 
 DEFAULT_CONFIG = {
     # which trained model (locates the checkpoint via the convention)
@@ -57,6 +69,8 @@ DEFAULT_CONFIG = {
     "pos_embed": "learnable lat",
     "trainData": "equiangular",
     "grid": "equiangular",          # equiangular | legendre-gauss | lobatto
+    "normalization_layer": "none",  # must match the trained run's own value
+    "loss_type": "spectral",        # must match the trained run's own value
     "index": 0,                     # 0/, 1/, ... training-config slot
     "single_step": True,
     # rollout
@@ -64,14 +78,9 @@ DEFAULT_CONFIG = {
     "save_interval_minutes": 30,
     # initial condition
     "ic": "galewsky",               # galewsky | real_world
-    "netcdf_path": None,            # required when ic == real_world
+    "dataset_name": None,           # required when ic == real_world, e.g. "1980_2025_odd_month"
     "ic_time": None,                # required when ic == real_world
     "pressure": None,               # required when ic == real_world (for naming)
-    # reference numerical solver run (ground truth for the per-step loss plot)
-    "ref_tau": [30000, 30000, 30],
-    "ref_cfl": 0.25,
-    "ref_semi_implicit": True,
-    "ref_dealias": True,
 }
 
 
@@ -91,20 +100,41 @@ def load_config():
     raw["index"] = int(raw["index"])
     raw["duration"] = float(raw["duration"])
     raw["save_interval_minutes"] = float(raw["save_interval_minutes"])
-    raw["ref_tau"] = [int(t) for t in raw["ref_tau"]]
-    raw["ref_cfl"] = float(raw["ref_cfl"])
+
 
     cfg = SimpleNamespace(**raw)
 
     if cfg.ic == "real_world":
         if not cfg.ic_time:
             raise ValueError("inference.ic_time is required when ic == real_world.")
-        if not cfg.netcdf_path:
-            raise ValueError("inference.netcdf_path is required when ic == real_world.")
+        if not cfg.dataset_name:
+            raise ValueError("inference.dataset_name is required when ic == real_world.")
         if cfg.pressure is None:
             raise ValueError("inference.pressure is required when ic == real_world (used for naming).")
     return cfg
 
+def numerical_model_info_from_neural_opeartor_model_info(model_dir):
+    """
+    Recover numerical model info(tau, semi_implicit, radiation) from the save neural operator model_info.json
+    
+    Args:
+        model_dir : The directory of the neural operator model
+    """
+    json_path = f"{model_dir}/model_info.json"
+    with open(json_path) as f:
+        model_info = json.load(f)
+    
+    training_data_path = model_info['training_data']
+    tau_2, tau_4, tau_8 = re.findall(r'tau_\((\d+),(\d+),(\d+)\)', training_data_path)[0]
+    method = re.findall(r'method_(\w+)', training_data_path)[0]
+    semi_implicit = True if method == "implicit" else False 
+    radiation = re.findall(r'rad_(\w+)', training_data_path)[0]
+    numerical_model_info = { 
+        "tau" : (tau_2, tau_4, tau_8),
+        "semi_implicit" : semi_implicit,
+        "radiation": radiation
+    }
+    return numerical_model_info 
 
 def main():
     cfg = load_config()
@@ -117,17 +147,10 @@ def main():
         pos_embed=cfg.pos_embed,
         trainData_path=cfg.trainData,
         grid=cfg.grid,
+        normalization_layer=cfg.normalization_layer,
+        loss_type=cfg.loss_type,
         index=cfg.index,
     )
-
-    # ------------------------------------------------------------------ #
-    # (1) Where would the inference trajectory live? If present, stop.
-    # ------------------------------------------------------------------ #
-    data_dir, data_file = neural_data_path(
-        duration=cfg.duration, ic=cfg.ic, pressure=cfg.pressure, ic_time=cfg.ic_time,
-        **model_kwargs,
-    )
-    data_path = Path(data_dir) / data_file
 
     print_in_box({
         "title": "Neural Operator Inference",
@@ -135,15 +158,15 @@ def main():
             f"resol = ({cfg.nlat}, {cfg.nlon}) | nfuture = {cfg.n_future} | grid = {cfg.grid}",
             f"nlayer = {cfg.num_layers} | embed = {cfg.embed_dim} | posEmbed = {cfg.pos_embed}",
             f"trainData = {cfg.trainData} | index = {cfg.index} | single_step = {cfg.single_step}",
-            f"duration = {cfg.duration} days | save_interval = {cfg.save_interval_minutes} min | ic = {cfg.ic}"
-            # f"data -> {data_path}",
+            f"normalization_layer = {cfg.normalization_layer} | loss_type = {cfg.loss_type}",
+            f"duration = {cfg.duration} days | save_interval = {cfg.save_interval_minutes} min | ic = {cfg.ic}",
         ],
     })
 
     # ------------------------------------------------------------------ #
-    # (2) Resolve the reference numerical solver's checkpoint/data paths
-    #     (same tau/cfl/etc convention as run_solver.py) - this is the
-    #     ground truth the SFNO rollout gets compared against.
+    # (1) Resolve the reference numerical solver's checkpoint (same tau/cfl/
+    #     etc convention as run_solver.py) - this is the ground truth the
+    #     SFNO rollout gets compared against.
     #
     #     run_model.py's neural branch spins the IC up for SPINUP_DAYS with
     #     the numerical solver *before* saving frame 0 (see run_model.py's
@@ -151,32 +174,52 @@ def main():
     #     frame t is really at absolute time SPINUP_DAYS + t*save_interval.
     #     The reference run covers that same head start so frames line up;
     #     plot_per_step_loss() offsets into it by warmup_frames.
+    #
+    #     Both the IC and the reference solver run non-dimensionally (see (2)
+    #     below), keyed by the dataset's own h_avg, so their checkpoint/data
+    #     trees carry the same dataset_* node run_solver.py uses. Trajectory-
+    #     path deduction and reuse (numerical + neural alike) are entirely
+    #     delegated to run() below - it derives each data path straight from
+    #     the checkpoint path it's given (see run_model.py's
+    #     _data_path_from_checkpoint).
     # ------------------------------------------------------------------ #
-    ref_ckpt_dir, ref_ckpt_file = numerical_checkpoint_path(
-        lmax=cfg.nlat // 2, tau=cfg.ref_tau, grid=cfg.grid, semi_implicit=cfg.ref_semi_implicit,
+    dataset_name = cfg.dataset_name if cfg.ic == "real_world" else None
+
+    # dataset-wide h_avg/h_amp (real-world only) feed the IC/reference solvers'
+    # own non-dimensionalization; run() reads its own T/U back off each
+    # checkpoint's model_info.json (see run_model.run()'s docstring).
+    h_avg = h_amp = None
+    if cfg.ic == "real_world":
+        h_avg, h_amp = load_h_stats(cfg.dataset_name)
+        print(f"    Using dataset-wide h_avg={h_avg:.2f} m, h_amp={h_amp:.2f} m from '{cfg.dataset_name}'")
+        
+    
+
+    ref_ckpt_dir = numerical_checkpoint_path(
+        lmax=cfg.nlat // 2, tau=ref_tau, grid=grid, semi_implicit=ref_semi_implicit,
+        dataset_name=dataset_name,
     )
-    ref_ckpt_path = Path(ref_ckpt_dir) / ref_ckpt_file
+    ref_info_path = Path(ref_ckpt_dir) / "model_info.json"
 
-    ref_duration = cfg.duration + SPINUP_DAYS
-    warmup_frames = round(SPINUP_DAYS * 1440.0 / cfg.save_interval_minutes)
 
-    ref_data_dir, ref_data_file = numerical_data_path(
-        lmax=cfg.nlat // 2, tau=cfg.ref_tau, grid=cfg.grid, semi_implicit=cfg.ref_semi_implicit,
-        duration=ref_duration, ic=cfg.ic, pressure=cfg.pressure, ic_time=cfg.ic_time,
-    )
-    ref_data_path = Path(ref_data_dir) / ref_data_file
+    if ref_info_path.is_file():
+        print(f"📦 Loading existing reference solver checkpoint {ref_ckpt_dir}")
+        ref_solver, _ = load_numerical_checkpoint(ref_ckpt_dir)
+        ref_solver.to(ref_solver.device)
+    else:
+        print(f"🛠  Initializing reference solver checkpoint -> {ref_ckpt_dir}")
+        ref_solver = ShallowWaterSolver(
+            lmax=cfg.nlat // 2, tau=ref_tau, grid=cfg.grid,
+            dealias=False, semi_implicit=ref_semi_implicit,
+            rad=ref_rad,h_avg=h_avg, h_amp=h_amp, non_dimensional=True,
+        )
+        ref_solver.to(ref_solver.device)
+        save_numerical_checkpoint(
+            ref_solver, ref_ckpt_dir, dataset_name=dataset_name,
+            pressure=cfg.pressure if cfg.ic == "real_world" else None,
+        )
 
-    need_neural = not data_path.is_file()
-    need_ref = not ref_data_path.is_file()
-
-    if not need_neural:
-        print(f"✅ Inference trajectory already exists at {data_path}.")
-    if not need_ref:
-        print(f"✅ Reference numerical trajectory already exists at {ref_data_path}.")
-
-    # ------------------------------------------------------------------ #
-    # (3) Resolve the trained model directory; it must already exist.
-    # ------------------------------------------------------------------ #
+    # Resolve the trained model directory; it must already exist.
     model_dir, single_name, multi_name, info_name = neural_model_path(**model_kwargs)
     ckpt_name = single_name if cfg.single_step else multi_name
     ckpt_path = Path(model_dir) / ckpt_name
@@ -189,126 +232,129 @@ def main():
         )
     print(f"📦 Using trained model {ckpt_path}")
 
-    print("Preparing solver for computing initial condition...")
-    ic_solver = ShallowWaterSolver(lmax=cfg.nlat//2, grid=cfg.grid, dealias=False)
-    ic_solver.to(ic_solver.device)
-
     if cfg.ic == "galewsky":
         print("Initial conidtion is galewsky")
         phivrtdivspec_0 = galewsky_initial_condition(model=ic_solver)
     elif cfg.ic == "real_world":
         print("Initial condition is real-world")
+        netcdf_path = Path("reanalysis_data") / cfg.dataset_name / "data.nc"
+        ds = xr.open_dataset(netcdf_path)
+        nlat_data, nlon_data = ds.sizes['latitude'], ds.sizes['longitude']
+        ds.close()
+        vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data // 2, mmax=nlat_data // 2,
+                            grid='equiangular', csphase=False).to(ref_solver.device)
+
+        start_load_time = time.perf_counter()
+        era5_dataset = xr.open_dataset(netcdf_path).load()
+        print(f"Finished loading ERA5 data in {(time.perf_counter() - start_load_time):2f} seconds")
+        
         phivrtdivspec_0 = rw_initial_condition(
-            model=ic_solver, netcdf_path=cfg.netcdf_path, ic_time=cfg.ic_time)
+            model=ref_solver, vSHT=vSHT, era5_dataset=era5_dataset, ic_time=cfg.ic_time
+            )
+        print("Preparing solver for grid->spec transformation and initial spin-up...")
+        # spin up the initial condition using numerical solver
+        state = phivrtdivspec_0
+        with torch.no_grad():
+            for i in tqdm.trange(int(86400*SPINUP_DAYS//(ref_solver.dt * ref_solver.T)), desc=f"🐺->...->🦮  Spinning up the initial condition for {SPINUP_DAYS} day"):
+                state = ref_solver.timestep(uspec=state, nsteps=1)
     else:
         raise ValueError(f"Unknown ic '{cfg.ic}' (expected galewsky or real_world).")
 
-    if need_neural:
-        run(
-            model_checkpoint=str(model_dir),
-            initial_condition=phivrtdivspec_0.clone(),
-            output_dir=data_dir,
-            file_name=data_file,
-            duration=cfg.duration,
-            save_interval_minutes=cfg.save_interval_minutes,
-            single_step=cfg.single_step,
-        )
+    # ------------------------------------------------------------------ #
+    # (2) Run the SFNO rollout and the reference numerical solver from the
+    #     same IC. Trajectory path deduction and reuse are entirely
+    #     delegated to run() - it derives where each trajectory lives
+    #     straight from the model_checkpoint path it's given (see
+    #     run_model.py's _data_path_from_checkpoint) and skips straight to
+    #     returning that path if a matching trajectory is already there.
+    # ------------------------------------------------------------------ #
+    neural_save_path = run(
+        model_checkpoint=str(model_dir),
+        initial_condition=phivrtdivspec_0.clone(),
+        duration=cfg.duration,
+        ic=cfg.ic,
+        pressure=cfg.pressure,
+        ic_time=cfg.ic_time,
+        dataset_name=dataset_name,
+        save_interval_minutes=cfg.save_interval_minutes,
+        single_step=cfg.single_step,
+    )
+    
+    ref_save_path = run(
+        model_checkpoint=str(ref_ckpt_dir),
+        initial_condition=phivrtdivspec_0.clone(),
+        duration=cfg.duration,
+        ic=cfg.ic,
+        pressure=cfg.pressure,
+        ic_time=cfg.ic_time,
+        dataset_name=dataset_name,
+        save_interval_minutes=cfg.save_interval_minutes,
+    )
+
+    data_dir = Path(neural_save_path).parent
+    data_file = Path(neural_save_path).name
 
     # ------------------------------------------------------------------ #
-    # (4) Run the reference numerical solver alongside, from the same IC.
-    # ------------------------------------------------------------------ #
-    if need_ref:
-        if ref_ckpt_path.is_file():
-            print(f"📦 Loading existing reference solver checkpoint {ref_ckpt_path}")
-            ref_solver = torch.load(ref_ckpt_path, weights_only=False)
-            ref_solver.to(ref_solver.device)
-        else:
-            print(f"🛠  Initializing reference solver checkpoint -> {ref_ckpt_path}")
-            ref_solver = ShallowWaterSolver(
-                cfg.nlat // 2, cfg.ref_tau, cfg.ref_cfl, grid=cfg.grid,
-                dealias=cfg.ref_dealias, semi_implicit=cfg.ref_semi_implicit,
-            )
-            ref_solver.to(ref_solver.device)
-            ref_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(ref_solver, ref_ckpt_path)
-
-        run(
-            model_checkpoint=str(ref_ckpt_path),
-            initial_condition=phivrtdivspec_0.clone(),
-            output_dir=ref_data_dir,
-            file_name=ref_data_file,
-            duration=ref_duration,
-            save_interval_minutes=cfg.save_interval_minutes,
-        )
-
-    # ------------------------------------------------------------------ #
-    # (5) Per-step relative spectral L2 loss of the SFNO rollout against
+    # (3) Per-step relative spectral L2 loss of the SFNO rollout against
     #     the reference numerical trajectory, plotted next to the .pt file.
     # ------------------------------------------------------------------ #
     plot_per_step_loss(
-        neural_traj_path=data_path,
-        ref_traj_path=ref_data_path,
-        ref_warmup_frames=warmup_frames,
+        neural_traj_path=Path(neural_save_path),
+        ref_traj_path=Path(ref_save_path),
         info_path=info_path,
         lmax=cfg.nlat // 2,
         grid=cfg.grid,
         save_interval_minutes=cfg.save_interval_minutes,
-        output_path=Path(data_dir) / f"{Path(data_file).stem}_l2_spectral_loss.png",
+        output_path=data_dir / f"{Path(data_file).stem}_l2_spectral_loss.png",
     )
 
     # ------------------------------------------------------------------ #
-    # (6) 2x4 sphere-projection comparison: rows = (reference, SFNO), columns
+    # (4) 2x4 sphere-projection comparison: rows = (reference, SFNO), columns
     #     = t=0/1/2/6 hours since each trajectory's own frame 0 (i.e. since
     #     the end of the warm-up spin-up). ref_traj is offset by
     #     warmup_frames so both trajectories' frame 0 is the same absolute time.
     # ------------------------------------------------------------------ #
-    neural_data = torch.load(data_path, weights_only=False)
-    ref_data_raw = torch.load(ref_data_path, weights_only=False)
-    ref_data_aligned = {
-        "metadata": ref_data_raw["metadata"],
-        "trajectory": ref_data_raw["trajectory"][warmup_frames:],
-    }
+    neural_data = torch.load(neural_save_path, weights_only=False)
+    ref_data = torch.load(ref_save_path, weights_only=False)
+
     plot_sphere_comparison(
-        ref_data=ref_data_aligned,
+        ref_data=ref_data,
         inf_data=neural_data,
         var="pv",
         hours=[0, 1, 6, 24],
-        output_path=str(Path(data_dir) / f"{Path(data_file).stem}_sphere_comparison.png"),
+        output_path=str(data_dir / f"{Path(data_file).stem}_sphere_comparison.png"),
         ref_label="Numerical (ground truth)",
         inf_label="SFNO (inference)",
     )
 
 
-def plot_per_step_loss(neural_traj_path, ref_traj_path, ref_warmup_frames, info_path, lmax, grid,
+def plot_per_step_loss(neural_traj_path, ref_traj_path, info_path, lmax, grid,
                         save_interval_minutes, output_path):
-    """Relative spectral L2 loss of the SFNO rollout vs. the reference
-    numerical trajectory, one value per saved step, saved as a line plot.
+    """Relative L2 loss (whichever loss_type the model was trained with) of
+    the SFNO rollout vs. the reference numerical trajectory, one value per
+    saved step, saved as a line plot.
 
-    Both trajectories are converted to grid space and normalized with the
-    model's own (mean, std) before the loss is computed, so the resulting
-    numbers are directly comparable to the training/validation loss.
-    ``ref_traj``'s first ``ref_warmup_frames`` frames are the SPINUP_DAYS
-    head start that ``neural_traj`` skips past before its own frame 0, so
-    ``ref_traj[ref_warmup_frames + t]`` is what lines up with ``neural_traj[t]``.
+    Both trajectories are converted to grid space and non-dimensionalized
+    with the model's own (T, U) before the loss is computed, so the
+    resulting numbers are directly comparable to the training/validation
+    loss. ``ref_traj``'s first ``ref_warmup_frames`` frames are the
+    SPINUP_DAYS head start that ``neural_traj`` skips past before its own
+    frame 0, so ``ref_traj[ref_warmup_frames + t]`` is what lines up with
+    ``neural_traj[t]``.
     """
     import json
 
     with open(info_path, "r") as f:
         model_info = json.load(f)
 
-    solver = ShallowWaterSolver(lmax=lmax, grid=grid, dealias=False)
+    solver = ShallowWaterSolver(lmax=lmax, grid=grid, dealias=False, non_dimensional=False)
     solver.to(solver.device)
-    
-    mean = torch.tensor(
-        [model_info["inp_mean_gp"], model_info["inp_mean_zeta"], model_info["inp_mean_delta"]],
-    ).reshape(3, 1, 1).to(solver.device)
-    std = torch.tensor(
-        [model_info["inp_std_gp"], model_info["inp_std_zeta"], model_info["inp_std_delta"]],
-    ).reshape(3, 1, 1).to(solver.device)
 
+    T, U = model_info["T"], model_info["U"]
+    loss_fn = LOSS_FUNCTIONS[model_info.get("loss_type", "spectral")]
 
     neural_traj = torch.load(neural_traj_path, weights_only=False)["trajectory"].to(solver.device)
-    ref_traj = torch.load(ref_traj_path, weights_only=False)["trajectory"][ref_warmup_frames:].to(solver.device)
+    ref_traj = torch.load(ref_traj_path, weights_only=False)["trajectory"].to(solver.device)
 
     n_steps = min(neural_traj.shape[0], ref_traj.shape[0])
     if neural_traj.shape[0] != ref_traj.shape[0]:
@@ -320,9 +366,9 @@ def plot_per_step_loss(neural_traj_path, ref_traj_path, ref_warmup_frames, info_
         for t in range(n_steps):
             prd = solver.spec2grid(neural_traj[t].to(torch.complex64))
             tar = solver.spec2grid(ref_traj[t].to(torch.complex64))
-            prd_n = (prd - mean) / std
-            tar_n = (tar - mean) / std
-            loss = spectral_l2loss_sphere(
+            prd_n = physical_to_nondim(prd, T, U)
+            tar_n = physical_to_nondim(tar, T, U)
+            loss = loss_fn(
                 solver, prd_n.unsqueeze(0), tar_n.unsqueeze(0), relative=True, squared=False,
             )
             losses.append(loss.item())
