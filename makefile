@@ -1,8 +1,13 @@
 CONFIG ?= config.yml
 
-.PHONY: train_single run_solver clean_reanalysis help
+.PHONY: train_single train_multi run_solver clean_reanalysis help
 
-
+clean_slurm:
+	@PREVCOUNT=$$(ls slurm_logs | wc -l); \
+	rm -rf slurm_scripts/*; \
+	rm -rf slurm_logs/*
+	CURRCOUNT=$$(ls slurm_logs | wc -l); \
+	echo "Removed $$(($$PREVCOUNT - $$CURRCOUNT)) files"; \
 
 clean_neural_output:
 	@PREVCOUNT=$$(ls model_output/neural_operator | wc -l); \
@@ -19,6 +24,9 @@ batch_simulation:
 
 train_single:
 	python src/neural_operator/train_singlestep.py $(CONFIG)
+
+train_multi:
+	python src/neural_operator/train_multistep.py $(CONFIG)
 
 download_era5:
 	python src/entries/download_era5.py $(CONFIG)

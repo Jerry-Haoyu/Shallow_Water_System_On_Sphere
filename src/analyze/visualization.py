@@ -8,11 +8,12 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parent.parent.parent  # Adjust .parent steps as needed
 sys.path.insert(0, str(SRC_DIR))
 
+import glob
 import os
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
-from matplotlib.ticker import AutoMinorLocator, MultipleLocator
+from matplotlib.ticker import AutoMinorLocator, MultipleLocator, FixedLocator
 
 import numpy as np
 import torch
@@ -795,3 +796,137 @@ def animate_spectrum(data,
     ax_1.plot(np.arange(1,len(bs)+1), bs, label=rf"intercept $b$")
     plt.legend()
     fig_1.savefig(f"{output_dir}/variation_of_bf.png")
+
+
+def plot_snapshot_northernPolarStereo(
+    simulation_data_dir,
+    vars,
+    lead_hour,
+    output_dir="visualization_output",
+    file_name=None,
+    central_longitude=-90.0,
+    true_scale_latitude=60.0,
+    lon_bounds=(-120.0, -60.0),
+    lat_bounds=(15.0, 85.0),
+    lon_gridline_spacing=10.0,
+    lat_gridline_spacing=10.0,
+    coastline_resolution="110m",
+    figsize=None,
+):
+    """
+    Plot a snapshot of `vars`, `lead_hour` hours ahead of a trajectory's frame 0,
+    on a North Polar Stereographic map - one panel per variable.
+
+    The default geometry (central_longitude, true_scale_latitude, lon_bounds,
+    lat_bounds) approximates the region shown in charney_plot.png: the North
+    American domain from Charney, Fjørtoft & von Neumann (1950)'s original
+    barotropic forecast - stereographic, true at 60N, meridionally centered
+    on 90W and spanning 120W-60W in longitude, 15N-85N in latitude. Meridians
+    and parallels are drawn every `lon_gridline_spacing` / `lat_gridline_spacing`
+    degrees and labeled where they cross the map boundary.
+
+    Parameters
+    ----------
+    simulation_data_dir : directory of solver trajectory `.pt` files (every
+                          file is one trajectory, as in SWEDataset).
+    vars                : list of variable names to plot side by side (see
+                          _VAR_INFO), e.g. ['pv', 'h'].
+    lead_hour           : hours after the trajectory's frame 0 to plot.
+    output_dir          : directory for the saved figure.
+    file_name           : basename of the trajectory file (inside
+                          simulation_data_dir) to plot; defaults to the first
+                          file in sorted(glob(simulation_data_dir/*.pt)).
+    central_longitude, true_scale_latitude, lon_bounds, lat_bounds :
+                          geometry of the North Polar Stereographic map (see
+                          ccrs.NorthPolarStereo / Axes.set_extent).
+    lon_gridline_spacing, lat_gridline_spacing :
+                          spacing (degrees) of the meridian/parallel gridlines,
+                          restricted to lon_bounds/lat_bounds so gridlines from
+                          outside the visible domain don't leak into the map's
+                          rectangular frame corners (a NorthPolarStereo quirk).
+    """
+    if file_name is None:
+        candidates = sorted(glob.glob(os.path.join(simulation_data_dir, "*.pt")))
+        if not candidates:
+            raise FileNotFoundError(f"No .pt trajectory files found in {simulation_data_dir}")
+        data_path = candidates[0]
+    else:
+        data_path = os.path.join(simulation_data_dir, file_name)
+
+    data = torch.load(data_path, map_location="cpu", weights_only=False)
+    solver, trajectory, lats, lons, sec_per_frame = _common_setup(data)
+
+    n_frames = trajectory.shape[0]
+    frame_idx = int(round(lead_hour * 3600.0 / sec_per_frame))
+    if frame_idx >= n_frames:
+        print(f"⚠️  lead_hour={lead_hour} (frame {frame_idx}) is past the end of "
+              f"the trajectory ({n_frames} frames); using the last frame.")
+        frame_idx = n_frames - 1
+    actual_hour = frame_idx * sec_per_frame / 3600.0
+
+    # Recenter longitude onto [-180, 180); `lon_order` reorders each field's
+    # longitude axis to match the recentered coordinates.
+    lons_c, lon_order = _center_longitudes(lons)
+    lons_deg, lats_deg = np.degrees(lons_c), np.degrees(lats)
+    Lon, Lat = np.meshgrid(lons_deg, lats_deg)
+
+    dev = solver.lap.device
+    with torch.no_grad():
+        uspec = trajectory[frame_idx].to(dev)
+        _cache = {}
+        fields = {
+            var: _field_from_uspec(solver, uspec, var, _cache).detach().cpu().numpy()[:, lon_order]
+            for var in vars
+        }
+
+    projection = ccrs.NorthPolarStereo(
+        central_longitude=central_longitude, true_scale_latitude=true_scale_latitude
+    )
+
+    n_cols = len(vars)
+    if figsize is None:
+        figsize = (6.0 * n_cols, 6.0)
+    fig, axes = plt.subplots(1, n_cols, figsize=figsize, subplot_kw={"projection": projection})
+    axes = np.atleast_1d(axes)
+
+    # Restricting the locators to lon_bounds/lat_bounds (rather than a global
+    # +/-180 range) keeps gridlines - and their boundary-intersection labels -
+    # out of the rectangular frame's corner slivers that fall outside the true
+    # lon/lat wedge (a NorthPolarStereo quirk for off-pole, non-square extents).
+    lon_gridlocs = np.arange(lon_bounds[0], lon_bounds[1] + 1e-6, lon_gridline_spacing)
+    lat_gridlocs = np.arange(lat_bounds[0], lat_bounds[1] + 1e-6, lat_gridline_spacing)
+
+    for ax, var in zip(axes, vars):
+        label, cmap_name = _VAR_INFO.get(var, (var, "coolwarm"))
+        field = fields[var]
+        vmin, vmax = float(np.percentile(field, 2)), float(np.percentile(field, 98))
+        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+        cmap = plt.get_cmap(cmap_name)
+
+        ax.set_extent([lon_bounds[0], lon_bounds[1], lat_bounds[0], lat_bounds[1]],
+                      crs=ccrs.PlateCarree())
+        ax.coastlines(resolution=coastline_resolution, color="black", linewidth=1)
+        gl = ax.gridlines(draw_labels=True, linestyle="--", linewidth=0.5, color="gray",
+                          xlocs=FixedLocator(lon_gridlocs), ylocs=FixedLocator(lat_gridlocs))
+        gl.xlabel_style = {"size": 8}
+        gl.ylabel_style = {"size": 8}
+
+        im = ax.pcolormesh(Lon, Lat, field, cmap=cmap, norm=norm, shading="auto",
+                           transform=ccrs.PlateCarree())
+        cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.05)
+        cbar.set_label(label)
+        ax.set_title(label)
+
+    fig.suptitle(f"Snapshot @ t={actual_hour:g}h  (source: {os.path.basename(data_path)})")
+
+    os.makedirs(output_dir, exist_ok=True)
+    var_tag = "_".join(vars)
+    out_path = os.path.join(output_dir, f"snapshot_northpolar_{var_tag}_{actual_hour:g}h.png")
+    # Neither fig.tight_layout() nor savefig(bbox_inches="tight") is safe here:
+    # both corrupt multi-panel GeoAxes gridliner label layout (the former raises
+    # a shapely "LinearRing not closed" error from the gridliner's boundary
+    # polygon; the latter silently drops all but the last axes' content).
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"📸 Saved north-polar-stereo snapshot -> {out_path}")
+    return out_path

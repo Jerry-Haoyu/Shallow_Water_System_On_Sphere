@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+SRC_DIR = Path(__file__).resolve().parent.parent.parent  # Adjust .parent steps as needed
+sys.path.insert(0, str(SRC_DIR))
+
+
 import glob
 import os
 import random
@@ -5,6 +11,12 @@ import random
 import torch
 
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
+from src.helpers.run_model import (
+    parse_dataset_and_pressure,
+    load_h_stats,
+    physical_scales,
+    physical_to_nondim,
+)
 
 
 class SWEDataset(torch.utils.data.Dataset):
@@ -18,12 +30,14 @@ class SWEDataset(torch.utils.data.Dataset):
     All files are assumed to share the same solver configuration
     """
 
-    def __init__(self, simulation_data_dir, n_future):
+    def __init__(self, simulation_data_dir, n_future, mode='residual', seed=None):
         self.simulation_data_dir = simulation_data_dir
         self.nfuture = n_future
-
-        # normalize training data by doing a Z-score like transformation
-        self.normalize = True 
+        self.mode= mode
+        if seed is not None:
+            print(f"Seeding random to {seed}")
+        self._rng = random.Random(seed)
+        
         # Pick starting opint randomly
         self.random_flag = True
         # Store trajectories type: either 'spec' or 'physical'
@@ -44,47 +58,31 @@ class SWEDataset(torch.utils.data.Dataset):
         # ------------------------------------------------------------------ #
         first = torch.load(self.file_list[0], map_location="cpu", weights_only=False)
         metadata = first["metadata"]
-        self.solver = ShallowWaterSolver(lmax=metadata["lmax"], grid=metadata["grid"], dealias=False)
+        self.solver = ShallowWaterSolver(lmax=metadata["lmax"], grid=metadata["grid"], dealias=False, non_dimensional=False)
         self.solver.to(self.solver.device)
         self.device = self.solver.device
+
+        # non-dimensionalization scales (T, U), keyed by this training data's
+        # own dataset-wide h_avg (README.md convention: recovered from
+        # simulation_data_dir's own dataset_*/pressure_* path nodes) - (None,
+        # None)/DEFAULT_HAVG fallback for galewsky-only data, which has no
+        # real-world dataset. Used in place of a z-score to scale samples
+        # in __getitem__ below.
+        self.dataset_name, self.pressure = parse_dataset_and_pressure(self.simulation_data_dir)
+        self.h_avg, self.h_amp = (
+            load_h_stats(self.dataset_name) if self.dataset_name else (None, None)
+        )
+        self.T, self.U = physical_scales(self.h_avg)
 
         # step_window spans the whole trajectory: any start step whose n_future
         # target still lands inside the trajectory. Inferred from its length.
         n_frames = first["trajectory"].shape[0]
         print(f"💿 SWE Dataset: Each trajectory has n_frames={n_frames} ")
-        self.step_window = (0, n_frames - 1 - self.nfuture)
+        self.step_window = (96, n_frames - 1 - self.nfuture) # only sample after 2 days
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(
                 f"Trajectory of length {n_frames} is too short for n_future={self.nfuture}"
             )
-
-        # compute normalization statistics (per-channel mean/std over grid space,
-        # accumulated across every frame of every trajectory) in place.
-        self._compute_stats()
-
-    def _compute_stats(self):
-        """Per-channel grid-space mean/std over all frames of all files."""
-        count = 0
-        sum_c = None
-        sumsq_c = None
-        with torch.no_grad():
-            for file in self.file_list:
-                trajectory = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
-                for t in range(trajectory.shape[0]):
-                    grid = self._spec_to_grid(trajectory[t].to(self.device))
-                    flat = grid.reshape(grid.shape[0], -1).double()
-                    if sum_c is None:
-                        channels = flat.shape[0]
-                        sum_c = torch.zeros(channels, dtype=torch.float64, device=self.device)
-                        sumsq_c = torch.zeros(channels, dtype=torch.float64, device=self.device)
-                    sum_c += flat.sum(dim=1)
-                    sumsq_c += (flat ** 2).sum(dim=1)
-                    count += flat.shape[1]
-
-        mean = sum_c / count
-        std = torch.sqrt(torch.clamp(sumsq_c / count - mean ** 2, min=0.0))
-        self.inp_mean = mean.reshape(-1, 1, 1).float().to(self.device)
-        self.inp_std = std.reshape(-1, 1, 1).float().to(self.device)
 
     def __len__(self):
         return len(self.file_list)
@@ -97,7 +95,10 @@ class SWEDataset(torch.utils.data.Dataset):
             return self.solver.spec2grid(uspec_single)
 
     def __getitem__(self, index):
-
+        """ 
+            Each sample is a (phivortdivphi_t, (phivortdiv_{t+1}-uvphi_t)), i.e., the input is the 
+            state in grid space at timestep t and the output is the difference of the same variables between step t and t+1
+        """
         file = self.file_list[index]
         try:
             uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
@@ -109,7 +110,7 @@ class SWEDataset(torch.utils.data.Dataset):
             uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
 
         # pick a random starting step within the whole-trajectory window
-        step_start = random.randint(self.step_window[0], self.step_window[1])
+        step_start = self._rng.randint(self.step_window[0], self.step_window[1])
         step_end = step_start + self.nfuture
         # print(f"Picking trajectory number {index} ")
         # print(f"step_start = {step_start}, step_end = {step_end}")
@@ -117,11 +118,78 @@ class SWEDataset(torch.utils.data.Dataset):
         uspec_target = uspec[step_start: step_end + 1]
 
         # first and last steps - convert based on input_type
-        inp = self._spec_to_grid(uspec_target[0].to(self.device)).float()
-        tar = self._spec_to_grid(uspec_target[-1].to(self.device)).float()
+        u_curr = self._spec_to_grid(uspec_target[0].to(self.device)).float()
+        u_next = self._spec_to_grid(uspec_target[-1].to(self.device)).float()
 
-        if self.normalize:
-            inp = (inp - self.inp_mean) / self.inp_std
-            tar = (tar - self.inp_mean) / self.inp_std
+        u_curr = physical_to_nondim(u_curr, self.T, self.U)
+        u_next = physical_to_nondim(u_next, self.T, self.U)
+        
+        if self.mode == 'residual':
+            return u_curr.clone(), (u_next-u_curr).clone(), (index, step_start)
+        elif self.mode == 'absolute':
+            return u_curr.clone(), u_next.clone(), (index, step_start)
 
-        return inp.clone(), tar.clone(), (index, step_start)
+
+class SWEMultiStepDataset(torch.utils.data.Dataset):
+    """Windowed dataset for multi-step curriculum training (see train_multistep.py).
+
+    Each item is a window of ``max_subsequent_steps + 1`` grid-space frames,
+    spaced ``n_future`` trajectory frames apart, starting at a random offset:
+    ``window[j]`` is the frame at trajectory step ``start + j * n_future`` for
+    ``j = 0 .. max_subsequent_steps``. In the curriculum pseudocode, ``window[0]``
+    plays "obs1 at t(1)" (what the frozen teacher rolls out from) and
+    ``window[j]`` for ``j >= 1`` plays "obs2"/"target at t(j+1)" depending on
+    which curriculum stage's ``teacher_step`` is indexing into it.
+    """
+
+    def __init__(self, simulation_data_dir, n_future, max_subsequent_steps, T, U):
+        self.simulation_data_dir = simulation_data_dir
+        self.n_future = n_future
+        self.max_subsequent_steps = max_subsequent_steps
+        self.T = T
+        self.U = U
+
+        self.file_list = sorted(glob.glob(os.path.join(simulation_data_dir, "*.pt")))
+        if not self.file_list:
+            raise FileNotFoundError(f"No .pt trajectory files found in {simulation_data_dir}")
+
+        # solver rebuilt from the shared metadata, same reasoning as SWEDataset.
+        first = torch.load(self.file_list[0], map_location="cpu", weights_only=False)
+        metadata = first["metadata"]
+        self.solver = ShallowWaterSolver(lmax=metadata["lmax"], grid=metadata["grid"], dealias=False, non_dimensional=False)
+        self.solver.to(self.solver.device)
+        self.device = self.solver.device
+
+        self.window_frames = max_subsequent_steps * n_future + 1
+        n_frames = first["trajectory"].shape[0]
+        print(f"💿 SWE Multi-Step Dataset: n_frames={n_frames}, window_frames={self.window_frames} "
+              f"(max_subsequent_steps={max_subsequent_steps}, n_future={n_future})")
+        self.step_window = (0, n_frames - self.window_frames)
+        if self.step_window[1] < self.step_window[0]:
+            raise ValueError(
+                f"Trajectory of length {n_frames} is too short for max_subsequent_steps="
+                f"{max_subsequent_steps} at n_future={n_future} (needs >= {self.window_frames} frames)."
+            )
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        file = self.file_list[index]
+        try:
+            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+        except Exception as e:
+            print(f"Warning: failed to load {file}: {e}. Falling back to next file.")
+            fallback_index = (index + 1) % len(self.file_list)
+            file = self.file_list[fallback_index]
+            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+
+        # pick a random starting step within the whole-trajectory window
+        start = random.randint(self.step_window[0], self.step_window[1])
+        idxs = [start + j * self.n_future for j in range(self.max_subsequent_steps + 1)]
+        uspec_window = uspec[idxs].to(self.device)
+
+        window = self.solver.spec2grid(uspec_window).float()
+        window = physical_to_nondim(window, self.T, self.U)
+
+        return window.clone(), (index, start)

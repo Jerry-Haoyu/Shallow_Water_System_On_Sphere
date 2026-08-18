@@ -2,39 +2,50 @@
 run_solver:
   # solver / resolution configuration
   lmax: 64
-  tau: [30000, 30, 40]
+  tau: [30000, 3, 2]
   cfl: 0.25
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
   semi_implicit: True
   dealias: False
+  non_dimensional: True        # rescale by dataset-wide U=sqrt(g*h_avg), T=radius/U; False = physical units
   # simulation
-  duration: 10                # days
+  duration: 10            # days
   save_interval_minutes: 30
   # initial condition
   ic: "real_world"               # galewsky | real_world
-  netcdf_path: "reanalysis_data/2026_07_(100,1000)hPa.nc"            # required when ic == real_world
-  ic_time: "2026-07-05T00:00:00"                   # required when ic == real_world, e.g. 2000-07-01T00:00:00
-  pressure: "(100,1000)"               # required when ic == real_world (for naming), e.g. 500
+  dataset_name: "1980_2025_odd_month_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
+  ic_time: "1995-07-01T00:00:00"                   # required when ic == real_world, e.g. 2000-07-01T00:00:00
+  pressure: "500"               # required when ic == real_world (for naming), e.g. 500
+  # radiative relaxation: Newtonian-relax geopotential toward a zonally-symmetric
+  # climatological equilibrium phi_eq(lat), mimicking radiation (real_world ic only)
+  rad: False
+  tau_rad: null                 # relaxation e-fold time, days; required when rad=True, e.g. 15 (~run duration)
+  rad_smooth_fraction: 0.5      # keep spherical-harmonic degrees l <= this*lmax in phi_eq's u profile
   checkpoint_only: False       # only initialize + save the solver checkpoint
 
 # configuration for make batch_simulation (one run_solver job per netcdf time point)
 batch_simulation:
   # data / time selection
-  netcdf_path: "reanalysis_data/2000_2025_odd_months_(100,1000).nc"
-  time_dim: "time"
+  dataset_name: "1980_2025_odd_month_500"   # reanalysis_data/<dataset_name>/data.nc
+  time_dim: "valid_time"
   engine: null                # xarray engine (e.g. cfgrib for grib); null = auto-detect
   stride: 1                   # use every Nth time point
   limit: null                 # only submit the first N (post-stride) time points
   # solver configuration, forwarded into each job's own run_solver.py config
   lmax: 64
-  tau: [30000, 30000, 30]
+  tau: [30000, 2, 2]
   cfl: 0.25
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
   semi_implicit: True
-  dealias: True
+  dealias: False
+  non_dimensional: True        # rescale by dataset-wide U=sqrt(g*h_avg), T=radius/U; False = physical units
   duration: 20                 # days
   save_interval_minutes: 30
-  pressure: "(100,1000)"       # required (for naming), e.g. 500
+  pressure: "500"       # required (for naming), e.g. 500
+  # radiative relaxation, forwarded into each job's own run_solver.py config
+  rad: False
+  tau_rad: null                 # relaxation e-fold time, days; required when rad=True, e.g. 15 (~run duration)
+  rad_smooth_fraction: 0.5
   # slurm knobs
   partition: "gpu"
   account: "gzhang13-group"
@@ -46,6 +57,7 @@ batch_simulation:
   python: "/data/gzhang13/a/hytang2/envs/swe/bin/python"
   script_dir: "slurm_scripts"
   config_dir: "slurm_scripts/configs"
+  ic_data_dir: "slurm_scripts/ic_data"  # per-job pre-sliced ERA5 IC files (see batch_simulation.py)
   log_dir: "slurm_logs"
   dry_run: False
 
@@ -54,45 +66,50 @@ inference:
   # which trained model (locates the checkpoint via the convention)
   nlat: 128
   nlon: 256
-  n_future: 2
-  num_layers: 5
-  embed_dim: 256
-  pos_embed: "learnable lat"
-  trainData: "2000_2025_odd_months_(100,1000)"
+  n_future: 6
+  num_layers: 4
+  embed_dim: 128
+  pos_embed: "none"
+  trainData: "1980_2025_odd_month_500"
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
-  index: 0                     # 0/, 1/, ... training-config slot
+  normalization_layer: "none"  # must match the trained run's own value
+  loss_type: "grid"        # must match the trained run's own value
+  index: 2                # 0/, 1/, ... training-config slot
   single_step: True
   # rollout
   duration: 3                # days
-  save_interval_minutes: 60
+  save_interval_minutes: 180
   # initial condition
   ic: "real_world"               # galewsky | real_world
-  netcdf_path: "reanalysis_data/2000_2025_odd_months_(100,1000).nc"            # required when ic == real_world
+  dataset_name: "1980_2025_odd_month_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
   ic_time: "2025-07-01T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
-  pressure: "(100,1000)"               # required when ic == real_world (for naming), e.g. 500
+  pressure: "500"               # required when ic == real_world (for naming), e.g. 500
 
 # configuration for make train_single
 train_single:
-  training_data_dir: "model_output/training_data/2000_2025_odd_months_(100,1000)"
-  batch_size: 32
-  lr: 1e-4
-  n_future: 2
+  # The training set directory
+  training_data_dir: "model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500/"
+  batch_size: 128
+  lr: 8e-4
+  n_future: 48
   # model architecture
-  num_layers: 5          # number of SFNO layers
+  num_layers: 4         # number of SFNO layers
   # scale_factor must stay 1 when pos_embed != "none": torch_harmonics's SFNO
   # applies pos_embed at full img_size resolution (before any downsampling
   # happens inside the SFNO blocks), but builds the embedding buffer at the
   # *downsampled* (scale_factor>1) resolution 
-  scale_factor: 1          # downsampling ratio
-  embed_dim: 256            # up-projection from 3 channels
-  pos_embed: "learnable lat"  # positional embedding before SFNO layers
-  epochs: 300
-  weight_decay: 0.01
-  validation_cadence: 25
-  warmup_epochs: 5
+  scale_factor: 3          # downsampling ratio
+  embed_dim: 128            # up-projection from 3 channels
+  pos_embed: "none"  # positional embedding before SFNO layers
+  normalization_layer: "layer_norm"  # none | layer_norm | instance_norm (applied inside each SFNO block)
+  loss_type: "grid"  # grid | spectral (see src/neural_operator/loss.py's LOSS_FUNCTIONS)
+  epochs: 3000
+  weight_decay: 0.05
+  validation_cadence: 100
+  warmup_epochs: 100
   warmup_start_factor: 0.001 
-  restart: True
-  restart_period: 10
+  restart: False
+  restart_period: 20
   restart_mult: 2
   compile: False
   # if true, search 0/, 1/, ... for a run with this same architecture (training
@@ -100,17 +117,56 @@ train_single:
   # start a brand new run from scratch.
   continue: True
 
+# configuration for make train_multi (teacher/student multi-step curriculum
+# fine-tuning on top of an already-trained single-step run - see
+# multi_step_curriculum_training.png). checkpoints_multi.pt lands in the SAME
+# run directory as the single-step checkpoint it builds on, so the fields
+# below (nlat .. index) must identify that existing `make train_single` run
+# exactly - same convention as `inference`'s single_step switch.
+train_multi:
+  nlat: 128
+  nlon: 256
+  n_future: 6
+  num_layers: 4
+  embed_dim: 128
+  pos_embed: "none"
+  grid: "equiangular"          # equiangular | legendre-gauss | lobatto
+  normalization_layer: "none"  # must match the single-step run's own value
+  loss_type: "grid"        # must match the single-step run's own value
+  index: 0                     # 0/, 1/, ... training-config slot (must already hold checkpoints_single.pt)
+  scale_factor: 3
+  residual_prediction: True
+  # curriculum data: point at a dataset_<name>/ leaf (same convention as
+  # train_single's training_data_dir) whose trajectories are long enough for
+  # max_subsequent_steps * n_future + 1 frames - can be a longer-duration
+  # dataset than the one used for single-step pretraining.
+  training_data_dir: "model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500"
+  max_subsequent_steps: 4      # curriculum rolls teacher_step from 1 up to this many single-step calls
+  epochs_per_stage: 50         # fixed epoch budget per curriculum stage 
+  batch_size: 64
+  lr: 2e-4
+  weight_decay: 0.01
+  validation_cadence: 5
+  warmup_epochs: 0
+  warmup_start_factor: 0.01
+  restart: False
+  restart_period: null
+  restart_mult: 1
+  compile: False
+  # resume THIS multistep run (checkpoints_multi.pt) if one already exists;
+  # max_subsequent_steps/epochs_per_stage must match the existing run exactly.
+  continue: False
+
 download_era5:
-  save_path: "reanalysis_data/2026_07_(100,1000)hPa.nc" 
-  year_start: 2026
-  year_end: 2026
-  months: [7]
-  day_start : 5
-  day_end: 10
+  dataset_name: "1995_2025_(1,7,11)_(1-7)_500,"    # reanalysis_data/<dataset_name>/{data.nc, h_stats.npz, h_stats_plot.png}
+  year_start: 1995
+  year_end: 2025
+  months: [1, 7, 11]
+  days: [1, 2, 3, 4, 5, 6, 7]
   time_option: "midnight" # ["midnight", "all"]
-  pressure_level_start: 100
-  pressure_level_end: 1000
-  vertical_integration: True 
+  pressure_level_start: 500
+  pressure_level_end: 500
+  vertical_integration: False 
 
 track_cyclone:
   

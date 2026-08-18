@@ -40,6 +40,7 @@ def _solver_from_metadata(metadata):
     solver = ShallowWaterSolver(
         lmax=metadata["lmax"],
         grid=metadata.get("grid", "equiangular"),
+        non_dimensional=False,
     )
     solver.to(solver.device)
     return solver
@@ -89,7 +90,7 @@ def _coarsen_view(solver, trajectory, factor):
     # too (the solver derives nlat = 2*lmax, nlon = 2*nlat), so the inverse SHT runs
     # over far fewer modes and grid points.
     lmax_c = max(4, solver.lmax // factor)
-    coarse = ShallowWaterSolver(lmax=lmax_c, grid=solver.grid)
+    coarse = ShallowWaterSolver(lmax=lmax_c, grid=solver.grid, non_dimensional=False)
     coarse = coarse.to(trajectory.device)
     traj_c = trajectory[:, :, :lmax_c, :lmax_c].contiguous()
     return coarse, traj_c

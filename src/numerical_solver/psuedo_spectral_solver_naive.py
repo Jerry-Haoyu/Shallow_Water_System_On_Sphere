@@ -25,7 +25,9 @@ class ShallowWaterSolver(AbstractSWSolver):
     """
 
     def __init__(self, lmax, tau=(10000, 30, 20), cfl=0.25, grid="equiangular",
-                 semi_implicit=True, robert_coeff=0.05, umax=120.0, dealias=True):
+                 semi_implicit=True, robert_coeff=0.05, umax=120.0, dealias=True,
+                 h_avg=None, h_amp=None, non_dimensional=True,
+                 rad=False, tau_rad=None):
         # The only resolution knob is lmax. Triangular truncation fixes mmax = lmax, and
         # the grid follows as nlat = 2*lmax, nlon = 2*nlat. dt is derived from CFL below.
         #
@@ -38,6 +40,32 @@ class ShallowWaterSolver(AbstractSWSolver):
         # dealias       : evaluate the quadratic nonlinear products on a 3/2-padded grid
         #                 so that aliasing of modes > lmax back into the retained band is
         #                 removed (Orszag's 3/2 rule; see dudtspec).
+        # h_avg, h_amp  : dataset-wide reference height / height-amplitude (meters, from
+        #                 e.g. reanalysis_data/<name>/h_stats.npz); fall back to the
+        #                 AbstractSWSolver defaults (10km / 120m) when not given.
+        # non_dimensional : rescale radius/gravity/havg/hamp/omega/umax by the length
+        #                 scale L=radius, velocity scale U=sqrt(g*havg) and time scale
+        #                 T=L/U before anything else is derived from them. The SWE
+        #                 tendency equations (dudtspec) are scale-covariant under this
+        #                 L/U/T rescaling, so the *same* code with rescaled constants
+        #                 integrates the non-dimensional state -- CFL/dt, hyperdiffusion,
+        #                 Coriolis and dudtspec all fall out correctly with no further
+        #                 changes. Set False to run fully dimensional (physical units).
+        # rad, tau_rad  : if rad=True, dudtspec relaxes geopotential toward a
+        #                 zonally-symmetric equilibrium phi_eq (see
+        #                 set_equilibrium_geopotential) with e-fold time tau_rad
+        #                 (days, physical regardless of non_dimensional -- unlike
+        #                 `tau`'s hyperdiffusion e-fold times, which are hours,
+        #                 since radiative relaxation timescales are naturally
+        #                 quoted in days).
+        #                 phi_eq itself is IC/dataset-specific, so it is not part of
+        #                 this constructor -- it must be set via
+        #                 set_equilibrium_geopotential before timestep() is called.
+        if rad and tau_rad is None:
+            raise ValueError("tau_rad is required when rad=True")
+        self.rad = bool(rad)
+        self.tau_rad_days = float(tau_rad) if tau_rad is not None else None
+
         self.start_time = time.perf_counter()
         print("Initializing the psuedo-spectral solver")
         super().__init__()
@@ -45,8 +73,45 @@ class ShallowWaterSolver(AbstractSWSolver):
         self.cfl = cfl
         self.semi_implicit = semi_implicit
         self.robert_coeff = robert_coeff
-        self.umax = umax
         self.dealias = dealias
+
+        radius_phys = float(self.radius)
+        omega_phys = float(self.omega)
+        gravity_phys = float(self.gravity)
+        havg_phys = float(h_avg) if h_avg is not None else float(self.havg)
+        hamp_phys = float(h_amp) if h_amp is not None else float(self.hamp)
+
+        self.non_dimensional = non_dimensional
+        self.U = float(np.sqrt(gravity_phys * havg_phys))   # gravity-wave speed (m/s)
+        self.havg_phys = havg_phys                           # physical reference height (m), for
+                                                               # rescaling other physical-unit constants
+                                                               # (e.g. initial_condition.py's umax/noise)
+        self.hamp_phys = hamp_phys                           # physical reference height amplitude (m);
+                                                               # kept alongside havg_phys so a checkpoint's
+                                                               # model_info.json can record both without
+                                                               # threading them through extra call sites.
+
+        if self.non_dimensional:
+            self.T = radius_phys / self.U                     # time scale (s); dt ends up in units of T
+            self.radius = torch.as_tensor(1.0, dtype=torch.float64)
+            self.gravity = torch.as_tensor(1.0, dtype=torch.float64)
+            self.havg = torch.as_tensor(1.0, dtype=torch.float64)
+            self.hamp = torch.as_tensor(hamp_phys / havg_phys, dtype=torch.float64)
+            self.omega = torch.as_tensor(omega_phys * self.T, dtype=torch.float64)
+            self.umax = umax / self.U
+        else:
+            self.T = 1.0                                       # dt is already physical seconds
+            self.radius = torch.as_tensor(radius_phys, dtype=torch.float64)
+            self.gravity = torch.as_tensor(gravity_phys, dtype=torch.float64)
+            self.havg = torch.as_tensor(havg_phys, dtype=torch.float64)
+            self.hamp = torch.as_tensor(hamp_phys, dtype=torch.float64)
+            self.omega = torch.as_tensor(omega_phys, dtype=torch.float64)
+            self.umax = umax
+
+        # relaxation-rate coefficient for dudtspec's rad term, in the solver's own
+        # time units (mirrors the hyperdiffusion tau->dt_seconds conversion below;
+        # self.T=1 in the dimensional branch, so this formula is unified across both).
+        self.inv_tau_rad = (self.T / (self.tau_rad_days * 86400.)) if self.rad else 0.0
 
         # spectral truncation and the grid it implies
         self.lmax = lmax
@@ -96,7 +161,11 @@ class ShallowWaterSolver(AbstractSWSolver):
 
         # compute the laplace and inverse laplace operators
         l = torch.arange(0, self.lmax).reshape(self.lmax, 1).double()
-        l = l.expand(self.lmax, self.mmax)
+        # .contiguous(): expand() is a stride-0 view (all columns share memory),
+        # which register_buffer accepts fine but load_state_dict's in-place
+        # copy_ into it later can't (overlapping destination elements) - give
+        # the buffer real, non-aliased storage instead.
+        l = l.expand(self.lmax, self.mmax).contiguous()
         # the laplace operator acting on the coefficients is given by - l (l + 1)
         lap = - l * (l + 1) / self.radius**2
         invlap = - self.radius**2 / l / (l + 1)
@@ -133,9 +202,13 @@ class ShallowWaterSolver(AbstractSWSolver):
         # n=2 (biharmonic damping scales with k^4)
         # n=4 (quad-harmonic damping scales with k^8)
         # n=8 (k^16)
-        damping_n2 = (-self.dt / (tau_2 * 3600.)) * (k_normalized ** 2)
-        damping_n4 = (-self.dt / (tau_4 * 3600.)) * (k_normalized ** 4)
-        damping_n8 = (-self.dt / (tau_8 * 3600.)) * (k_normalized ** 8)
+        # tau is a physical e-fold time in hours regardless of non_dimensional, so the
+        # ratio needs the *physical* elapsed time per step (dt*T collapses to dt when
+        # T=1, i.e. the dimensional case).
+        dt_seconds = self.dt * self.T
+        damping_n2 = (-dt_seconds / (tau_2 * 3600.)) * (k_normalized ** 2)
+        damping_n4 = (-dt_seconds / (tau_4 * 3600.)) * (k_normalized ** 4)
+        damping_n8 = (-dt_seconds / (tau_8 * 3600.)) * (k_normalized ** 8)
 
         # Combine the scales in exponent space before applying torch.exp
         hyperdiff = torch.exp(torch.asarray(damping_n2 + damping_n4 + damping_n8))
@@ -161,6 +234,10 @@ class ShallowWaterSolver(AbstractSWSolver):
         self.register_buffer('hyperdiff', hyperdiff)
         self.register_buffer('hyperdiff2', hyperdiff2)
         self.register_buffer('quad_weights', quad_weights)
+        # zonally-symmetric equilibrium geopotential dudtspec relaxes toward when
+        # rad=True; IC/dataset-specific so it starts at zero and is filled in by
+        # set_equilibrium_geopotential (not part of the persisted checkpoint config).
+        self.register_buffer('phi_eq_spec', torch.zeros(self.lmax, self.mmax, dtype=torch.complex128))
         
         
         ### Basic Logging ###
@@ -170,9 +247,11 @@ class ShallowWaterSolver(AbstractSWSolver):
             'title' : "SWE Psuedo-Spectral Solver Configuration" ,
             'lines' : [
                 f"Spectral resolution (l_max,mmax) = {self.lmax, self.mmax} | (nlon, nlat) = ({self.nlon}, {self.nlat})",
-                f"Integrator is {integrator}| CFL constant is {self.cfl} | dt = {self.dt}",
+                f"Integrator is {integrator}| CFL constant is {self.cfl} | dt = {self.dt:.4g} ({'non-dim' if self.non_dimensional else 's'})",
+                f"non_dimensional = {self.non_dimensional} | U = {self.U:.2f} m/s | T = {self.T:.2f} s",
                 f"Numerical Quadrature : {self.grid}",
                 f"Dealiasing by 3/2 padding : {str(self.dealias)}",
+                f"Radiative relaxation (rad) : {self.rad}" + (f" | tau_rad = {self.tau_rad_days:.4g} days" if self.rad else ""),
                 f"Device : {self.device}"
             ]
         }
@@ -195,6 +274,17 @@ class ShallowWaterSolver(AbstractSWSolver):
     def reset_time(self):
         """Forget the stored leapfrog level so the next timestep restarts the scheme."""
         self._uspec_prev = None
+
+    def set_equilibrium_geopotential(self, phi_eq_spec):
+        """Set phi_eq, the zonally-symmetric background dudtspec's rad term relaxes
+        geopotential toward (see dudtspec). Must be called before timestep() on a
+        rad=True solver -- phi_eq is IC/dataset-specific (derived from the ERA5
+        dataset's own climatology, see initial_condition.radiative_equilibrium_geopotential),
+        so it isn't a constructor argument and isn't part of the persisted checkpoint.
+        """
+        if not self.rad:
+            raise RuntimeError("set_equilibrium_geopotential called but solver was constructed with rad=False")
+        self.phi_eq_spec.copy_(torch.tril(phi_eq_spec).to(self.phi_eq_spec.dtype))
 
     def grid2spec(self, ugrid):
         """
@@ -239,8 +329,8 @@ class ShallowWaterSolver(AbstractSWSolver):
         """
         Remove dimensions from variables
         """
-        uspec[0] = (uspec[0] - self.havg * self.gravity) / self.hamp / self.gravity
-        # vorticity is measured in 1/s so we normalize using sqrt(g h) / r
+        uspec[0] = (uspec[0] - self.havg * self.gravity) / self.hamp / self.gravity 
+        # vorticity is measured in 1/s so we normalize using sqrt(g h) / r : ratio of earth's radi traveled per second
         uspec[1:] = uspec[1:] * self.radius / torch.sqrt(self.gravity * self.havg)
         return uspec
 
@@ -317,6 +407,12 @@ class ShallowWaterSolver(AbstractSWSolver):
 
         tmpspec = grid2spec(ugrid[0] + 0.5 * (uvgrid[0]**2 + uvgrid[1]**2))
         dudtspec[2] = dudtspec[2] - self.lap * tmpspec
+
+        # Newtonian relaxation of geopotential toward the equilibrium background
+        # phi_eq (mimicking radiation) -- linear in phi, so this is applied directly
+        # in spectral space rather than round-tripping through grid space.
+        if self.rad:
+            dudtspec[0] = dudtspec[0] - self.inv_tau_rad * (uspec[0] - self.phi_eq_spec)
 
         return dudtspec
     

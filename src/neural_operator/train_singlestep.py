@@ -12,7 +12,7 @@ from src.helpers.print import *
 from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator as SFNO
 
 from src.neural_operator.dataset import SWEDataset
-from src.neural_operator.loss import spectral_l2loss_sphere
+from src.neural_operator.loss import LOSS_FUNCTIONS
 from src.helpers.run_model import neural_model_path
 
 import csv
@@ -22,6 +22,7 @@ import time
 import json
 import warnings
 import yaml
+import re
 from types import SimpleNamespace 
 
 import matplotlib
@@ -46,7 +47,9 @@ class SFNOSingleStepTrainer:
         scale_factor=1,
         embed_dim=16,
         residual_prediction=True,
-        pos_embed='learnable lat'
+        pos_embed='learnable lat',
+        normalization_layer='none',
+        loss_type='spectral',
     ):
         print("😗 😗 Starting SFNO Single Step Training 😗 😗 ".center(100))
 
@@ -61,6 +64,8 @@ class SFNOSingleStepTrainer:
         self.embed_dim = embed_dim
         self.residual_prediction = residual_prediction
         self.pos_embed = pos_embed
+        self.normalization_layer = normalization_layer
+        self.loss_type = loss_type
         self.training_data_dir = training_data_dir
 
         # check if gpu is available here, if not, stop the training immediately
@@ -75,8 +80,17 @@ class SFNOSingleStepTrainer:
             self.ds, [1 - validation_split, validation_split]
         )
         self.nlat, self.nlon = self.ds.solver.nlat, self.ds.solver.nlon
-        self.inp_mean_gp, self.inp_mean_zeta, self.inp_mean_delta  = self.ds.inp_mean[0].item(), self.ds.inp_mean[1].item(), self.ds.inp_mean[2].item()
-        self.inp_std_gp, self.inp_std_zeta, self.inp_std_delta = self.ds.inp_std[0].item(), self.ds.inp_std[1].item(), self.ds.inp_std[2].item()
+
+        # dataset provenance and the non-dimensionalization scales (T, U) are
+        # computed once, inside SWEDataset itself (from this same
+        # training_data_dir - README.md's dataset_*/pressure_* path-node
+        # convention) - sourced here rather than recomputed, so what's
+        # recorded below (model_info.json) always matches what the dataset
+        # actually scaled its samples with. (None, None) h_avg/h_amp for
+        # galewsky-only training data, which has no real-world dataset.
+        self.dataset_name, self.pressure = self.ds.dataset_name, self.ds.pressure
+        self.h_avg, self.h_amp = self.ds.h_avg, self.ds.h_amp
+        self.T, self.U = self.ds.T, self.ds.U
 
         # Initalize the model
         self.model = SFNO(
@@ -84,12 +98,12 @@ class SFNOSingleStepTrainer:
             num_layers=num_layers, scale_factor=scale_factor, embed_dim=embed_dim,
             residual_prediction=residual_prediction,
             pos_embed=pos_embed, use_mlp=True,
-            normalization_layer="none",
+            normalization_layer=self.normalization_layer,
         ).to(self.device)
 
         # Loss is a plain function (solver, prd, tar) -> scalar; the solver used
         # for the spherical harmonic transform lives on the dataset.
-        self.loss = spectral_l2loss_sphere
+        self.loss = LOSS_FUNCTIONS[self.loss_type]
         self.solver = self.ds.solver
 
     @staticmethod
@@ -118,7 +132,8 @@ class SFNOSingleStepTrainer:
             "n_future": self.n_future, "num_layers": self.num_layers,
             "pos_embed": self.pos_embed, "scale_factor": self.scale_factor,
             "embed_dim": self.embed_dim, "residual_prediction": self.residual_prediction,
-            "normalization_layer": "none", "training_data": self.training_data_dir,
+            "normalization_layer": self.normalization_layer, "loss_type": self.loss_type,
+            "training_data": self.training_data_dir,
         }
 
     @staticmethod
@@ -195,14 +210,14 @@ class SFNOSingleStepTrainer:
         # (README.md). neural_model_path is the single source of truth for the
         # tree so inference.py resolves exactly what the trainer writes:
         #
-        #   resol_*/nfuture_*/nlayer_*/embed_*/trainData_*/posEmbed_*/grid_*/<index>/
+        #   resol_*/nfuture_*/nlayer_*/embed_*/trainData_*/posEmbed_*/grid_*/norm_*/loss_*/<index>/
         #
         # The optimization hyperparameters are NOT encoded in the path; instead
         # each new training config for the same architecture lands in the next
         # integer sub-directory (0/, 1/, 2/, ...) and is documented in
         # model_info.json. The log tree mirrors the checkpoint tree under LOG_ROOT.
         # ------------------------------------------------------------------ #
-        self.train_data_tag = os.path.basename(os.path.normpath(self.training_data_dir))
+        self.train_data_tag = re.findall(r"dataset_(\w+)",self.training_data_dir)[0]
         model_path_kwargs = dict(
             resol=(self.nlat, self.nlon),
             n_future=self.n_future,
@@ -211,6 +226,8 @@ class SFNOSingleStepTrainer:
             pos_embed=self.pos_embed,
             trainData_path=self.train_data_tag,
             grid=self.solver.grid,
+            normalization_layer=self.normalization_layer,
+            loss_type=self.loss_type,
         )
 
         # If continue_training is set, search 0/, 1/, ... for a run with the
@@ -294,9 +311,10 @@ class SFNOSingleStepTrainer:
                 f"pos_embed = {self.pos_embed} : positional embedding before SFNO layers",
                 f"scale_factor = {self.scale_factor} : downsampling ratio",
                 f"embed_dim = {self.embed_dim} : up-projection from 3 channels",
-                f"training_data = {self.training_data_dir}",
-                f"inp_mean = ({self.inp_mean_gp:.2f}, {self.inp_mean_zeta:.2f}, {self.inp_mean_delta:.2f})",
-                f"inp_std = ({self.inp_std_gp:.2f}, {self.inp_std_zeta:.2f}, {self.inp_std_delta:.2f})",
+                f"normalization_layer = {self.normalization_layer} : none | layer_norm | instance_norm",
+                f"loss_type = {self.loss_type} : grid | spectral",
+                f"dataset_name = {self.dataset_name} | pressure = {self.pressure}",
+                f"h_avg = {self.h_avg} | h_amp = {self.h_amp} | U = {self.U:.2f} | T = {self.T:.2f}",
                 f"epochs = {epochs} ({'RESUMING from ' + str(self.resume_from_epoch) if self.resume else 'fresh run'})",
                 f"lr = {lr}",
                 f"batch_size = {batch_size}" ,
@@ -326,15 +344,16 @@ class SFNOSingleStepTrainer:
             "scale_factor" : self.scale_factor , # downsampling ratio"
             "embed_dim" : self.embed_dim , # up-projection from 3 channels"
             "residual_prediction" : self.residual_prediction ,
-            "normalization_layer" : "none" ,
+            "normalization_layer" : self.normalization_layer ,
+            "loss_type" : self.loss_type ,
             "run_index" : self.run_index ,
             "training_data" : self.training_data_dir ,
-            "inp_mean_gp" : self.inp_mean_gp ,
-            "inp_mean_zeta" : self.inp_mean_zeta ,
-            "inp_mean_delta" : self.inp_mean_delta ,
-            "inp_std_gp" : self.inp_std_gp ,
-            "inp_std_zeta" : self.inp_std_zeta ,
-            "inp_std_delta" : self.inp_std_delta ,
+            "dataset_name" : self.dataset_name ,
+            "pressure" : self.pressure ,
+            "h_avg" : self.h_avg ,
+            "h_amp" : self.h_amp ,
+            "U" : self.U ,
+            "T" : self.T ,
             "epochs" : epochs,
             "lr" : lr ,
             "batch_size" : batch_size ,
@@ -648,6 +667,8 @@ def main():
         "embed_dim" : 16,
         "residual_prediction" : True,
         "pos_embed" : 'learnable lat',
+        "normalization_layer" : "none",   # none | layer_norm | instance_norm
+        "loss_type" : "spectral",         # grid | spectral (see loss.py's LOSS_FUNCTIONS)
         "batch_size" : 128,
         "lr" : 5e-4,
         "epochs" : 100,
@@ -686,6 +707,8 @@ def main():
         embed_dim=train_config.embed_dim,
         residual_prediction=train_config.residual_prediction,
         pos_embed=train_config.pos_embed,
+        normalization_layer=train_config.normalization_layer,
+        loss_type=train_config.loss_type,
     )
     
     trainer.train(

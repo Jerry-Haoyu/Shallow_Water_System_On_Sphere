@@ -37,6 +37,7 @@ import xarray as xr
 import yaml
 import tqdm
 import json
+from datetime import datetime, timedelta
 import re
 from torch_harmonics.sht import RealVectorSHT
 
@@ -55,9 +56,8 @@ from src.helpers.run_model import (
 )
 from src.helpers.print import print_in_box
 
-# Must match the hardcoded spin-up length in run_model.py's neural branch
-# ("Spinning up the initial condition" loop, run_model.py:320).
-SPINUP_DAYS = 3.0
+
+
 
 DEFAULT_CONFIG = {
     # which trained model (locates the checkpoint via the convention)
@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     "dataset_name": None,           # required when ic == real_world, e.g. "1980_2025_odd_month"
     "ic_time": None,                # required when ic == real_world
     "pressure": None,               # required when ic == real_world (for naming)
+    "spinup_days": 1.0,
 }
 
 
@@ -100,6 +101,7 @@ def load_config():
     raw["index"] = int(raw["index"])
     raw["duration"] = float(raw["duration"])
     raw["save_interval_minutes"] = float(raw["save_interval_minutes"])
+    raw["spinup_days"] = int(raw['spinup_days'])
 
 
     cfg = SimpleNamespace(**raw)
@@ -113,26 +115,26 @@ def load_config():
             raise ValueError("inference.pressure is required when ic == real_world (used for naming).")
     return cfg
 
-def numerical_model_info_from_neural_opeartor_model_info(model_dir):
+def numerical_model_info_from_neural_opeartor_model_info(neural_model_dir):
     """
     Recover numerical model info(tau, semi_implicit, radiation) from the save neural operator model_info.json
     
     Args:
-        model_dir : The directory of the neural operator model
+        neural_model_dir : The directory of the neural operator model
     """
-    json_path = f"{model_dir}/model_info.json"
+    json_path = f"{neural_model_dir}/model_info.json"
     with open(json_path) as f:
         model_info = json.load(f)
     
     training_data_path = model_info['training_data']
+    # print(f"The training_data_path is {training_data_path}")
     tau_2, tau_4, tau_8 = re.findall(r'tau_\((\d+),(\d+),(\d+)\)', training_data_path)[0]
     method = re.findall(r'method_(\w+)', training_data_path)[0]
-    semi_implicit = True if method == "implicit" else False 
-    radiation = re.findall(r'rad_(\w+)', training_data_path)[0]
+    radiation = re.findall(r'radiation_(\w+)', training_data_path)[0]
     numerical_model_info = { 
-        "tau" : (tau_2, tau_4, tau_8),
-        "semi_implicit" : semi_implicit,
-        "radiation": radiation
+        "tau" : (float(tau_2), float(tau_4), float(tau_8)),
+        "semi_implicit" : True if method == "implicit" else False ,
+        "rad": True if radiation == 'rad' else False
     }
     return numerical_model_info 
 
@@ -163,26 +165,7 @@ def main():
         ],
     })
 
-    # ------------------------------------------------------------------ #
-    # (1) Resolve the reference numerical solver's checkpoint (same tau/cfl/
-    #     etc convention as run_solver.py) - this is the ground truth the
-    #     SFNO rollout gets compared against.
-    #
-    #     run_model.py's neural branch spins the IC up for SPINUP_DAYS with
-    #     the numerical solver *before* saving frame 0 (see run_model.py's
-    #     "Spinning up the initial condition" loop), so the SFNO trajectory's
-    #     frame t is really at absolute time SPINUP_DAYS + t*save_interval.
-    #     The reference run covers that same head start so frames line up;
-    #     plot_per_step_loss() offsets into it by warmup_frames.
-    #
-    #     Both the IC and the reference solver run non-dimensionally (see (2)
-    #     below), keyed by the dataset's own h_avg, so their checkpoint/data
-    #     trees carry the same dataset_* node run_solver.py uses. Trajectory-
-    #     path deduction and reuse (numerical + neural alike) are entirely
-    #     delegated to run() below - it derives each data path straight from
-    #     the checkpoint path it's given (see run_model.py's
-    #     _data_path_from_checkpoint).
-    # ------------------------------------------------------------------ #
+
     dataset_name = cfg.dataset_name if cfg.ic == "real_world" else None
 
     # dataset-wide h_avg/h_amp (real-world only) feed the IC/reference solvers'
@@ -193,10 +176,24 @@ def main():
         h_avg, h_amp = load_h_stats(cfg.dataset_name)
         print(f"    Using dataset-wide h_avg={h_avg:.2f} m, h_amp={h_amp:.2f} m from '{cfg.dataset_name}'")
         
+    # Resolve the trained model directory; it must already exist.
+    model_dir, single_name, multi_name, info_name = neural_model_path(**model_kwargs)
+    ckpt_name = single_name if cfg.single_step else multi_name
+    ckpt_path = Path(model_dir) / ckpt_name
+    info_path = Path(model_dir) / info_name
+
+    if not ckpt_path.is_file() or not info_path.is_file():
+        raise FileNotFoundError(
+            f"No trained model found at {model_dir} (expected {ckpt_name} and {info_name}). "
+            f"Train it first with `make train_single`."
+        )
+    print(f"📦 Using trained model {ckpt_path}")
     
+    ref_num_model_info = numerical_model_info_from_neural_opeartor_model_info(neural_model_dir=model_dir)
+    ref_tau, ref_semi_implicit, ref_rad = ref_num_model_info['tau'], ref_num_model_info['semi_implicit'], ref_num_model_info['rad']
 
     ref_ckpt_dir = numerical_checkpoint_path(
-        lmax=cfg.nlat // 2, tau=ref_tau, grid=grid, semi_implicit=ref_semi_implicit,
+        lmax=cfg.nlat // 2, tau=ref_tau, grid=cfg.grid, semi_implicit=ref_semi_implicit, rad=ref_rad,
         dataset_name=dataset_name,
     )
     ref_info_path = Path(ref_ckpt_dir) / "model_info.json"
@@ -219,22 +216,10 @@ def main():
             pressure=cfg.pressure if cfg.ic == "real_world" else None,
         )
 
-    # Resolve the trained model directory; it must already exist.
-    model_dir, single_name, multi_name, info_name = neural_model_path(**model_kwargs)
-    ckpt_name = single_name if cfg.single_step else multi_name
-    ckpt_path = Path(model_dir) / ckpt_name
-    info_path = Path(model_dir) / info_name
-
-    if not ckpt_path.is_file() or not info_path.is_file():
-        raise FileNotFoundError(
-            f"No trained model found at {model_dir} (expected {ckpt_name} and {info_name}). "
-            f"Train it first with `make train_single`."
-        )
-    print(f"📦 Using trained model {ckpt_path}")
 
     if cfg.ic == "galewsky":
         print("Initial conidtion is galewsky")
-        phivrtdivspec_0 = galewsky_initial_condition(model=ic_solver)
+        phivrtdivspec_0 = galewsky_initial_condition(model=ref_solver)
     elif cfg.ic == "real_world":
         print("Initial condition is real-world")
         netcdf_path = Path("reanalysis_data") / cfg.dataset_name / "data.nc"
@@ -255,8 +240,9 @@ def main():
         # spin up the initial condition using numerical solver
         state = phivrtdivspec_0
         with torch.no_grad():
-            for i in tqdm.trange(int(86400*SPINUP_DAYS//(ref_solver.dt * ref_solver.T)), desc=f"🐺->...->🦮  Spinning up the initial condition for {SPINUP_DAYS} day"):
+            for i in tqdm.trange(int(86400*cfg.spinup_days//(ref_solver.dt * ref_solver.T)), desc=f"🐺->...->🦮  Spinning up the initial condition for {cfg.spinup_days} day"):
                 state = ref_solver.timestep(uspec=state, nsteps=1)
+        phivrtdivspec_0_spinned_up = state
     else:
         raise ValueError(f"Unknown ic '{cfg.ic}' (expected galewsky or real_world).")
 
@@ -268,25 +254,27 @@ def main():
     #     run_model.py's _data_path_from_checkpoint) and skips straight to
     #     returning that path if a matching trajectory is already there.
     # ------------------------------------------------------------------ #
+    ic_time = (datetime.fromisoformat(cfg.ic_time) + timedelta(days=cfg.spinup_days)).isoformat()
     neural_save_path = run(
         model_checkpoint=str(model_dir),
-        initial_condition=phivrtdivspec_0.clone(),
+        initial_condition=phivrtdivspec_0_spinned_up.clone(),
         duration=cfg.duration,
         ic=cfg.ic,
         pressure=cfg.pressure,
-        ic_time=cfg.ic_time,
+        ic_time=ic_time,
         dataset_name=dataset_name,
         save_interval_minutes=cfg.save_interval_minutes,
         single_step=cfg.single_step,
     )
     
+    
     ref_save_path = run(
         model_checkpoint=str(ref_ckpt_dir),
-        initial_condition=phivrtdivspec_0.clone(),
+        initial_condition=phivrtdivspec_0_spinned_up.clone(),
         duration=cfg.duration,
         ic=cfg.ic,
         pressure=cfg.pressure,
-        ic_time=cfg.ic_time,
+        ic_time=ic_time,
         dataset_name=dataset_name,
         save_interval_minutes=cfg.save_interval_minutes,
     )
@@ -321,7 +309,7 @@ def main():
         ref_data=ref_data,
         inf_data=neural_data,
         var="pv",
-        hours=[0, 1, 6, 24],
+        hours=[0, 6, 12, 24],
         output_path=str(data_dir / f"{Path(data_file).stem}_sphere_comparison.png"),
         ref_label="Numerical (ground truth)",
         inf_label="SFNO (inference)",
@@ -330,20 +318,6 @@ def main():
 
 def plot_per_step_loss(neural_traj_path, ref_traj_path, info_path, lmax, grid,
                         save_interval_minutes, output_path):
-    """Relative L2 loss (whichever loss_type the model was trained with) of
-    the SFNO rollout vs. the reference numerical trajectory, one value per
-    saved step, saved as a line plot.
-
-    Both trajectories are converted to grid space and non-dimensionalized
-    with the model's own (T, U) before the loss is computed, so the
-    resulting numbers are directly comparable to the training/validation
-    loss. ``ref_traj``'s first ``ref_warmup_frames`` frames are the
-    SPINUP_DAYS head start that ``neural_traj`` skips past before its own
-    frame 0, so ``ref_traj[ref_warmup_frames + t]`` is what lines up with
-    ``neural_traj[t]``.
-    """
-    import json
-
     with open(info_path, "r") as f:
         model_info = json.load(f)
 
