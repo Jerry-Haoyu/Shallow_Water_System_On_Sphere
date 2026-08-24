@@ -93,6 +93,7 @@ class SFNOSingleStepTrainer:
         self.dataset_name, self.pressure = self.ds.dataset_name, self.ds.pressure
         self.h_avg, self.h_amp = self.ds.h_avg, self.ds.h_amp
         self.T, self.U = self.ds.T, self.ds.U
+        self.save_interval_minutes = self.ds.save_interval_minutes
 
         # Initalize the model
         self.model = SFNO(
@@ -310,7 +311,7 @@ class SFNOSingleStepTrainer:
             "title": "SFNO Model Basic Architecture and Training Config",
             "lines": [
                 f"nlat = {self.nlat} | nlon = {self.nlon} : Resolution",
-                f"n_future = {self.n_future} : M(D_t) = D_(t+n_future*0.5h)",
+                f"n_future = {self.n_future} : M(D_t) = D_(t+n_future*{self.save_interval_minutes}min)",
                 f"num_layers = {self.num_layers} : number of SFNO layers",
                 f"pos_embed = {self.pos_embed} : positional embedding before SFNO layers",
                 f"scale_factor = {self.scale_factor} : downsampling ratio",
@@ -361,6 +362,7 @@ class SFNOSingleStepTrainer:
             "h_amp" : self.h_amp ,
             "U" : self.U ,
             "T" : self.T ,
+            "save_interval_minutes" : self.save_interval_minutes ,
             "epochs" : epochs,
             "lr" : lr ,
             "batch_size" : batch_size ,

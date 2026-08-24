@@ -62,6 +62,14 @@ class SWEDataset(torch.utils.data.Dataset):
         self.solver.to(self.solver.device)
         self.device = self.solver.device
 
+        # minutes between consecutive saved frames in these trajectory files -
+        # 30 for PS-solver output (the historical/default convention); ERA5-direct
+        # trajectories (see src/entries/build_era5_trajectory_dataset.py) record
+        # their own real cadence (typically 60, ERA5's native hourly resolution)
+        # here instead. Recorded into model_info.json so inference-time rollout
+        # (run_model.py's run()) knows how many minutes n_future actually spans.
+        self.save_interval_minutes = metadata.get("save_interval_minutes", 30)
+
         # non-dimensionalization scales (T, U), keyed by this training data's
         # own dataset-wide h_avg (README.md convention: recovered from
         # simulation_data_dir's own dataset_*/pressure_* path nodes) - (None,

@@ -519,13 +519,17 @@ def run(model_checkpoint,
         n_future = model_info['n_future']
         nlat, nlon = model_info['nlat'], model_info['nlon']
         grid = model_info.get('grid', 'equiangular')
+        # minutes between consecutive training frames the model was trained on -
+        # 30 for PS-solver output (historical default), the real ERA5 cadence
+        # (e.g. 60) for ERA5-direct training data (see dataset.py/train_singlestep.py).
+        train_interval_minutes = model_info.get('save_interval_minutes', 30)
 
-        if save_interval_minutes % (30 * n_future) != 0:
+        if save_interval_minutes % (train_interval_minutes * n_future) != 0:
             raise RuntimeError(
                 f"When running neural operators, save interval must be an integer "
-                f"multiple of {30 * n_future} minutes")
+                f"multiple of {train_interval_minutes * n_future} minutes")
         # number of autoregressive model calls between two saved frames
-        model_steps_per_save = max(1, int(save_interval_minutes // (30 * n_future)))
+        model_steps_per_save = max(1, int(save_interval_minutes // (train_interval_minutes * n_future)))
 
         run_log_content = {
             "title": "Running Single-Step SFNO Inference",
