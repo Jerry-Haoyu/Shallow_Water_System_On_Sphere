@@ -100,6 +100,11 @@ train_single:
   # *downsampled* (scale_factor>1) resolution 
   scale_factor: 3          # downsampling ratio
   embed_dim: 128            # up-projection from 3 channels
+  # dbg_8_26_stage_0 architecture fix (see debug_train_8_26/stage0.md Findings):
+  # residual_prediction=False since targets are already (u_next-u_curr) deltas;
+  # inner_skip="linear" is the previously-unreachable per-block skip.
+  residual_prediction: False
+  inner_skip: "linear"
   pos_embed: "none"  # positional embedding before SFNO layers
   normalization_layer: "layer_norm"  # none | layer_norm | instance_norm (applied inside each SFNO block)
   loss_type: "grid"  # grid | spectral (see src/neural_operator/loss.py's LOSS_FUNCTIONS)
