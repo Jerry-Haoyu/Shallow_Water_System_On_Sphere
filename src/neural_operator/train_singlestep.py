@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch_harmonics
 from torch.utils.data import Dataset, DataLoader
 from src.helpers.print import *
-from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator as SFNO
+from src.neural_operator.sfno_model import SphericalFourierNeuralOperator as SFNO
 
 from src.neural_operator.dataset import SWEDataset
 from src.neural_operator.loss import LOSS_FUNCTIONS
@@ -46,7 +46,8 @@ class SFNOSingleStepTrainer:
         num_layers=4,
         scale_factor=1,
         embed_dim=16,
-        residual_prediction=True,
+        residual_prediction=False,
+        inner_skip='linear',
         pos_embed='learnable lat',
         normalization_layer='none',
         loss_type='spectral',
@@ -63,6 +64,7 @@ class SFNOSingleStepTrainer:
         self.scale_factor = scale_factor
         self.embed_dim = embed_dim
         self.residual_prediction = residual_prediction
+        self.inner_skip = inner_skip
         self.pos_embed = pos_embed
         self.normalization_layer = normalization_layer
         self.loss_type = loss_type
@@ -97,6 +99,7 @@ class SFNOSingleStepTrainer:
             img_size=(self.nlat, self.nlon), grid=self.ds.solver.grid,
             num_layers=num_layers, scale_factor=scale_factor, embed_dim=embed_dim,
             residual_prediction=residual_prediction,
+            inner_skip=inner_skip,
             pos_embed=pos_embed, use_mlp=True,
             normalization_layer=self.normalization_layer,
         ).to(self.device)
@@ -132,6 +135,7 @@ class SFNOSingleStepTrainer:
             "n_future": self.n_future, "num_layers": self.num_layers,
             "pos_embed": self.pos_embed, "scale_factor": self.scale_factor,
             "embed_dim": self.embed_dim, "residual_prediction": self.residual_prediction,
+            "inner_skip": self.inner_skip,
             "normalization_layer": self.normalization_layer, "loss_type": self.loss_type,
             "training_data": self.training_data_dir,
         }
@@ -311,6 +315,8 @@ class SFNOSingleStepTrainer:
                 f"pos_embed = {self.pos_embed} : positional embedding before SFNO layers",
                 f"scale_factor = {self.scale_factor} : downsampling ratio",
                 f"embed_dim = {self.embed_dim} : up-projection from 3 channels",
+                f"residual_prediction = {self.residual_prediction} : whole-network output += raw input",
+                f"inner_skip = {self.inner_skip} : per-block skip inside each SFNO block (none | linear | identity)",
                 f"normalization_layer = {self.normalization_layer} : none | layer_norm | instance_norm",
                 f"loss_type = {self.loss_type} : grid | spectral",
                 f"dataset_name = {self.dataset_name} | pressure = {self.pressure}",
@@ -344,6 +350,7 @@ class SFNOSingleStepTrainer:
             "scale_factor" : self.scale_factor , # downsampling ratio"
             "embed_dim" : self.embed_dim , # up-projection from 3 channels"
             "residual_prediction" : self.residual_prediction ,
+            "inner_skip" : self.inner_skip ,
             "normalization_layer" : self.normalization_layer ,
             "loss_type" : self.loss_type ,
             "run_index" : self.run_index ,
@@ -665,7 +672,16 @@ def main():
         "num_layers" : 4,
         "scale_factor" : 3,
         "embed_dim" : 16,
-        "residual_prediction" : True,
+        # False: SWEDataset(mode='residual', the default used here) targets are
+        # already (u_next - u_curr) deltas; the whole-network residual_prediction
+        # skip would instead push the model's raw output toward u_curr (an O(1)
+        # state), a scale mismatch with the small delta target it's trained
+        # against. See debug_train_8_26/stage0.md Findings.
+        "residual_prediction" : False,
+        # "linear" | "identity" | "none" - per-block skip inside each SFNO
+        # block, missing from torch_harmonics' public constructor (see
+        # src/neural_operator/sfno_model.py and stage0.md Findings).
+        "inner_skip" : "linear",
         "pos_embed" : 'learnable lat',
         "normalization_layer" : "none",   # none | layer_norm | instance_norm
         "loss_type" : "spectral",         # grid | spectral (see loss.py's LOSS_FUNCTIONS)
@@ -706,6 +722,7 @@ def main():
         scale_factor=train_config.scale_factor,
         embed_dim=train_config.embed_dim,
         residual_prediction=train_config.residual_prediction,
+        inner_skip=train_config.inner_skip,
         pos_embed=train_config.pos_embed,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,

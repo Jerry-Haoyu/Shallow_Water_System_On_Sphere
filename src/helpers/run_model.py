@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import tqdm
 
-from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator as SFNO
+from src.neural_operator.sfno_model import SphericalFourierNeuralOperator as SFNO
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.helpers.print import print_in_box, finish_simulation_log
 
@@ -542,6 +542,7 @@ def run(model_checkpoint,
             scale_factor=model_info['scale_factor'],
             embed_dim=model_info['embed_dim'],
             residual_prediction=model_info.get('residual_prediction', True),
+            inner_skip=model_info.get('inner_skip', 'none'),
             pos_embed=model_info['pos_embed'], use_mlp=True,
             normalization_layer=model_info.get('normalization_layer', 'none'),
         ).to(device)
