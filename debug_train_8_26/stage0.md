@@ -102,7 +102,111 @@ For both subtasks, after the training finished, initiate inference for both usin
 We are on cluster. There are two skills that request a cpu and a gpu node and prepares the python virtual environment. More info can be found on `https://computing-docs.readthedocs.io/en/latest/basics.html`
 
 
-## Findings 
+## Findings
 
+*(This section is updated as work on `dbg_8_26_stage_0` progresses; jobs still running are marked as such and will be filled in once they finish.)*
+
+### Possible-cause verification
+1. **Confirmed.** Read the installed `torch_harmonics` source
+   (`torch_harmonics/examples/models/sfno.py`): `SphericalFourierNeuralOperatorBlock`
+   does support `inner_skip`/`outer_skip`, but `SphericalFourierNeuralOperator.__init__`'s
+   block-construction loop never passes them through - every block silently used
+   `inner_skip="none"`. There was no way to reach `inner_skip="linear"` through
+   the public constructor as this repo was calling it.
+2. **Not directly tested this stage.** Isolating Gibbs-phenomenon pollution from
+   the PS-solver's spectral truncation would need a dedicated ablation (e.g.
+   comparing solver output with/without damping time `A`). Subtask 2 (training
+   directly on raw ERA5, no PS solver in the loop at all) is an indirect test of
+   this same hypothesis, since it removes the numerical solver entirely.
+3. **Additional cause found (not in the original list above).** `train_singlestep.py`'s
+   `SFNODataset` targets are already `(u_next - u_curr)` deltas (`mode='residual'`,
+   the default), but the model's whole-network `residual_prediction=True` skip
+   was adding the raw input state back onto the decoder output - biasing the
+   model's raw output toward `u_curr` (an O(1) physical state) while it was
+   trained against a much smaller delta target. This scale mismatch is a
+   plausible independent contributor to the reported symptoms.
+
+### Architecture fix (both subtasks)
+- Added `src/neural_operator/sfno_model.py`: a local subclass of
+  `torch_harmonics`'s `SphericalFourierNeuralOperator` that rebuilds `self.blocks`
+  with `inner_skip`/`outer_skip` threaded through. `inner_skip="none"` reproduces
+  the upstream architecture exactly (verified identical `state_dict` shapes), so
+  old checkpoints stay loadable; `train_singlestep.py` and `run_model.py`
+  (inference-time reconstruction) both now import this local class instead of
+  `torch_harmonics`'s directly.
+- `train_singlestep.py`'s defaults changed to `residual_prediction=False` and
+  `inner_skip="linear"` (finding 3 and finding 1 above, respectively). Both
+  values are recorded in `model_info.json` / `_architecture_signature()`, so old
+  and new checkpoints land in different run indices rather than colliding.
+- Both subtasks use the same `inner_skip="linear"`, `residual_prediction=False`
+  choice - the reasoning is about the model, not the data source, so there's no
+  basis to treat them differently (per stage0's "at your choice, depending on
+  reviewing my code" for subtask 2).
+- Also fixed two hardcoded 30-minute-cadence assumptions surfaced while building
+  subtask 2's pipeline (ERA5-direct data is hourly, not the PS-solver's 30 min);
+  both changes default to the old literal `30`/`96` for any file that doesn't
+  record its own cadence, so existing PS-solver checkpoints/data are unaffected:
+  - `run_model.py`'s inference rollout math (`30` -> `model_info['save_interval_minutes']`)
+  - `dataset.py`'s "only sample after 2 days" warmup window (`96` -> `round(2*24*60/save_interval_minutes)`)
+
+### Subtask 1 - retrain on existing PS-solver data with the architecture fix
+- `training_data_dir` unchanged: `model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500/`
+- Config: `config.yml`'s existing `train_single:` section, with `residual_prediction: False` /
+  `inner_skip: "linear"` added. All other hyperparameters (`n_future=48, num_layers=4,
+  embed_dim=128, scale_factor=3, pos_embed=none, normalization_layer=layer_norm,
+  loss_type=grid, lr=8e-4, weight_decay=0.05, warmup_epochs=100, epochs=3000`) were
+  left as already configured: among the runs in `training_logs/neural_operator/`,
+  the closest-matching prior architecture (same `n_future/embed_dim/normalization_layer`)
+  had already reached `train_loss≈0.65` without diverging by the time it stopped,
+  so there was no evidence its optimization hyperparameters needed changing - the
+  causes being fixed here are architectural, not tuning-related.
+- Checkpoint (once training finishes): `checkpoints/neural_operator/resol_128|256/nfuture_48/nlayer_4/embed_128/trainData_(1980_2025_odd_month_500)/posEmbed_none/grid_eq/norm_layer/loss_grid/1/` (run index `1` - a fresh index because the new `inner_skip`/`residual_prediction` keys changed the architecture signature from index `0`'s old runs).
+- **Status: training in progress** (sbatch job `930185`, `l40s` partition, submitted 2026-08-24; 3000 epochs, ~15s/epoch once warmed up). Inference not yet run.
+
+### Subtask 2 - train directly on ERA5 (no PS solver)
+No code path for this existed before this stage (training data was previously
+always PS-solver output, per `README.md`); built from scratch:
+- `debug_train_8_26/config_era5_direct_download.yml`: downloads one **continuous**
+  hourly ERA5 trajectory (`time_option: "all"`, single pressure level 500hPa) via
+  the existing, unmodified `download_era5.py` - unlike `config.yml`'s own
+  `download_era5:` section, which only pulls sparse midnight snapshots for
+  PS-solver initial conditions. Dataset: `era5_direct_2023_06_500` (June 2023,
+  one pilot month, ~720 raw hourly frames).
+- `src/entries/build_era5_trajectory_dataset.py` (new): converts the continuous
+  `(u,v)` netCDF into chunked spectral `(Φ,ζ,δ)` trajectory `.pt` files, applying
+  the same per-frame balance-equation diagnosis
+  `src/numerical_solver/initial_condition.py`'s `rw_initial_condition` already
+  does for a single IC, across every hourly frame. `chunk_hours=72` (3-day
+  files) -> ~10 files for the pilot month. Output:
+  `model_output/neural_direct/era5/dataset_era5_direct_2023_06_500/pressure_500/`.
+- `debug_train_8_26/config_train_era5_direct.yml`: same `inner_skip="linear"`,
+  `residual_prediction=False` as subtask 1; `n_future=6` now means a **6-hour**
+  forecast target (not 3 hours - ERA5 frames are 60 min apart, not the PS
+  solver's 30 min; see the cadence-generalization fix above).
+  `batch_size` lowered to 8: `SWEDataset.__len__` is its file count, and this
+  pilot dataset only has ~10 files (vs subtask 1's 276), so a large batch size
+  would leave almost nothing to iterate over per epoch.
+- **Deliberately scoped small first**: one pilot month, one contiguous chunk,
+  before spending more CDS download time/storage on a larger multi-month
+  dataset - stage0.md flagged "you are likely going to encounter problems
+  (size limit etc.)"; scaling this up (more months, more diversity) is the
+  natural next step once the pipeline is validated end-to-end.
+- **Status: pipeline built, jobs running as of this writing** - download
+  (`930196`, `node` partition), conversion and training to follow once the
+  download finishes (sbatch scripts already written:
+  `slurm_scripts/dbg_8_26_stage0_subtask2_convert.slurm`,
+  `slurm_scripts/dbg_8_26_stage0_subtask2_train.slurm`).
+
+### Inference
+Not yet run for either subtask (both are still training/pipeline-building as of
+this writing). One design note for when it is: `inference.py`'s
+`numerical_model_info_from_neural_opeartor_model_info` recovers a reference
+numerical-solver config by regex-matching `tau_(...)_method_..._radiation_...`
+out of the neural model's recorded `training_data` path - this only exists for
+PS-solver-generated training data (subtask 1). Subtask 2's `training_data_dir`
+has no such nodes, and conceptually there's no "rerun the numerical solver"
+reference for it anyway (the natural ground truth is the real ERA5 trajectory
+itself) - subtask 2 inference will need a separate procedure rather than
+`make inference` as-is; documented here once implemented.
 
 
