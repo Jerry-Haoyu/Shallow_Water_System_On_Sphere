@@ -191,22 +191,59 @@ always PS-solver output, per `README.md`); built from scratch:
   dataset - stage0.md flagged "you are likely going to encounter problems
   (size limit etc.)"; scaling this up (more months, more diversity) is the
   natural next step once the pipeline is validated end-to-end.
-- **Status: pipeline built, jobs running as of this writing** - download
-  (`930196`, `node` partition), conversion and training to follow once the
-  download finishes (sbatch scripts already written:
-  `slurm_scripts/dbg_8_26_stage0_subtask2_convert.slurm`,
-  `slurm_scripts/dbg_8_26_stage0_subtask2_train.slurm`).
+- **Status: COMPLETE.** Download (`930196`), conversion (`930215`), and
+  training (`930217`) all finished successfully. Training was fast (~0.08s/epoch
+  given only 10 files - all 3000 epochs in ~4 minutes): `train_loss` dropped
+  508 -> 0.76, `validation_loss` (last recorded, epoch 2999) = 1.28.
+  Checkpoint: `checkpoints/neural_operator/resol_128|256/nfuture_6/nlayer_4/embed_128/trainData_(era5_direct_2023_06_500)/posEmbed_none/grid_eq/norm_layer/loss_grid/0/`.
 
 ### Inference
-Not yet run for either subtask (both are still training/pipeline-building as of
-this writing). One design note for when it is: `inference.py`'s
-`numerical_model_info_from_neural_opeartor_model_info` recovers a reference
-numerical-solver config by regex-matching `tau_(...)_method_..._radiation_...`
-out of the neural model's recorded `training_data` path - this only exists for
-PS-solver-generated training data (subtask 1). Subtask 2's `training_data_dir`
-has no such nodes, and conceptually there's no "rerun the numerical solver"
-reference for it anyway (the natural ground truth is the real ERA5 trajectory
-itself) - subtask 2 inference will need a separate procedure rather than
-`make inference` as-is; documented here once implemented.
+
+**Subtask 1**: not yet run - training (job `930185`) is still in progress
+(3000 epochs at ~14s/epoch, ~11-12 hours total). Once it finishes, run via
+`make inference` (config.yml's `inference:` section, pointed at this run's
+architecture/index) as stage0.md instructs - subtask 1's training data is
+PS-solver-generated, so `inference.py`'s existing numerical-reference-solver
+comparison applies unmodified.
+
+**Subtask 2**: `inference.py`'s `numerical_model_info_from_neural_opeartor_model_info`
+recovers a reference numerical-solver config by regex-matching
+`tau_(...)_method_..._radiation_...` out of the neural model's recorded
+`training_data` path - this only exists for PS-solver-generated training data
+(subtask 1). Subtask 2's `training_data_dir` has no such nodes, and
+conceptually there's no "rerun the numerical solver" reference for it anyway
+(the natural ground truth is the real ERA5 trajectory itself). Wrote a
+separate procedure instead: `src/entries/inference_era5_direct.py` (config:
+`debug_train_8_26/config_inference_era5_direct.yml`) - takes one already-converted
+chunk as ground truth, seeds the model with its first frame, rolls the model
+forward autoregressively at its own cadence (6-hour steps here), and compares
+against that same chunk (subsampled to match). Reuses `inference.py`'s
+`plot_per_step_loss`/`plot_sphere_comparison` unmodified.
+
+Ran against the `2023_06_28_00_to_2023_06_30_23` chunk (an informal held-out
+choice - all 10 chunks were part of `SWEDataset`'s random train/val file split
+during training, so this is not a rigorously held-out test period). Output:
+`model_output/neural_operator/resol_128|256/nfuture_6/nlayer_4/embed_128/trainData_(era5_direct_2023_06_500)/posEmbed_none/grid_eq/norm_layer/loss_grid/0/duration_2.75/ic_rw/pressure_500/dataset_era5_direct_2023_06_500/2023_06_28{_sphere_comparison,_l2_spectral_loss}.png`.
+
+**Comments:**
+- Qualitatively, `2023_06_28_sphere_comparison.png` shows the SFNO rollout
+  tracking the real ERA5 potential-vorticity field's fine-scale eddy structure
+  closely through t=24h - a clear, visible fix for the originally-reported
+  "no visible dynamics" symptom (point 2 in stage0.md's opening description).
+  This is a strong qualitative signal that the architecture fix (inner_skip +
+  removing the residual_prediction scale mismatch) addresses the root
+  complaint, independent of which training data is used.
+- Quantitatively, `2023_06_28_l2_spectral_loss.png` still shows a fairly high
+  relative spectral L2 loss - jumping to ~0.6 after the first 6-hour step and
+  plateauing around ~0.8-0.9 by 60 hours. This is in the same rough range as
+  the originally-reported ~60% error, despite the visibly good large-scale
+  agreement - plausibly because (a) spectral L2 is sensitive to small-scale/
+  high-wavenumber discrepancies that aren't very visible on the sphere plot,
+  (b) this pilot dataset is tiny (10 files, one month) with no true held-out
+  period, so some of this is a generalization gap, not an architecture
+  problem. Scaling subtask 2's dataset up (more months/years, a genuine
+  held-out period) would be needed to separate these two explanations - not
+  done in this stage given time/CDS-download constraints (see subtask 2's
+  "deliberately scoped small first" note above).
 
 
