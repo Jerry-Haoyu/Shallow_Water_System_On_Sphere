@@ -1,0 +1,30 @@
+# Subtask 2 (debug_train_8_26/stage0.md): download a CONTINUOUS ERA5 trajectory
+# (hourly, single pressure level) instead of the sparse midnight-only snapshots
+# config.yml's own download_era5: section uses for PS-solver initial conditions.
+#
+# Usage: python src/entries/download_era5.py debug_train_8_26/config_era5_direct_download.yml
+download_era5:
+  dataset_name: "era5_direct_2023_06_500"   # reanalysis_data/<dataset_name>/{data.nc, h_stats.npz, h_stats_plot.png}
+  year_start: 2023
+  year_end: 2023
+  months: [6]              # single month -> the year/month/day/time cross-product
+  day_start: 1              # download_era5.py stays a single continuous span
+  day_end: 30               # (June has 30 days; avoids the Feb 29/31 edge case)
+  time_option: "all"        # hourly - the finest ERA5 offers (no 30-min data exists)
+  pressure_level_start: 500
+  pressure_level_end: 500
+  vertical_integration: False
+
+# Subtask 2, step 2: convert the continuous (u,v) netCDF above into chunked
+# spectral (Phi,zeta,delta) trajectory .pt files SWEDataset can train on
+# directly (matches the same lmax/grid subtask 1 trained at, for comparability).
+#
+# Usage: python src/entries/build_era5_trajectory_dataset.py debug_train_8_26/config_era5_direct_download.yml
+build_era5_trajectory:
+  dataset_name: "era5_direct_2023_06_500"
+  pressure: "500"
+  lmax: 64
+  grid: "equiangular"
+  chunk_hours: 240              # frames per output .pt file (240h = 10 days at hourly cadence)
+  frame_interval_minutes: 60    # ERA5's native hourly cadence (no 30-min data exists)
+  output_root: "model_output/neural_direct/era5"
