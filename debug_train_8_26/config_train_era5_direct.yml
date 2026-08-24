@@ -1,0 +1,38 @@
+# Subtask 2 (debug_train_8_26/stage0.md): train directly on ERA5-derived
+# trajectories (src/entries/build_era5_trajectory_dataset.py output) rather
+# than PS-solver-generated data. Architecture choices are kept congruent with
+# subtask 1's fix (see debug_train_8_26/stage0.md Findings) - the
+# inner_skip/residual_prediction reasoning is about the model, not the data
+# source, so both subtasks use the same values.
+#
+# Usage: python src/neural_operator/train_singlestep.py debug_train_8_26/config_train_era5_direct.yml
+train_single:
+  training_data_dir: "model_output/neural_direct/era5/dataset_era5_direct_2023_06_500/pressure_500/"
+  # SWEDataset's __len__ is its file count (one random window sampled per file
+  # per epoch) - with only ~10 files from this one pilot month (vs subtask 1's
+  # 276), batch_size is kept small so an "epoch" isn't just 1-2 batches. See
+  # debug_train_8_26/stage0.md Findings re: scaling this dataset up.
+  batch_size: 8
+  lr: 8e-4
+  # 6 * frame_interval_minutes (60, hourly ERA5 - see build_era5_trajectory's
+  # frame_interval_minutes) = 6h-ahead forecast target, NOT 0.5h*n_future like
+  # the PS-solver convention (see dataset.py/train_singlestep.py's use of each
+  # file's own recorded save_interval_minutes).
+  n_future: 6
+  num_layers: 4
+  scale_factor: 3
+  embed_dim: 128
+  residual_prediction: False
+  inner_skip: "linear"
+  pos_embed: "none"
+  normalization_layer: "layer_norm"
+  loss_type: "grid"
+  epochs: 3000
+  weight_decay: 0.05
+  validation_cadence: 100
+  warmup_epochs: 100
+  warmup_start_factor: 0.001
+  restart: False
+  restart_period: 20
+  restart_mult: 2
+  compile: False

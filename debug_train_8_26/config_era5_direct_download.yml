@@ -25,6 +25,9 @@ build_era5_trajectory:
   pressure: "500"
   lmax: 64
   grid: "equiangular"
-  chunk_hours: 240              # frames per output .pt file (240h = 10 days at hourly cadence)
+  chunk_hours: 72                # frames per output .pt file (72h = 3 days; ~10 files/month,
+                                  # each with a 2-day warmup (see dataset.py's step_window) +
+                                  # enough room for n_future - more independent "trajectories"
+                                  # for SWEDataset than a few long files would give)
   frame_interval_minutes: 60    # ERA5's native hourly cadence (no 30-min data exists)
   output_root: "model_output/neural_direct/era5"
