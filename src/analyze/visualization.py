@@ -505,6 +505,91 @@ def plot_sphere_comparison(ref_data, inf_data, var, hours, output_path,
     print(f"📸 Saved sphere comparison plot -> {output_path}")
 
 
+def plot_box_comparison(ref_data, inf_data, var, hours, output_path,
+                        ref_label="Ground Truth", inf_label="Inference",
+                        figsize=None):
+    """
+    2 x len(hours) grid of ``var`` rendered on a flat lon/lat box: row 0 from
+    ``ref_data``, row 1 from ``inf_data``, one column per entry of ``hours``.
+    The box-projection counterpart to :func:`plot_sphere_comparison` - same
+    data selection, row/column layout, and color normalization, just
+    ``imshow``'d on a lon/lat box (as in :func:`animate_swe_on_box`'s
+    per-frame rendering) instead of ``plot_surface``'d on a sphere.
+
+    Parameters
+    ----------
+    ref_data, inf_data : dict {'metadata', 'trajectory'} as written by run().
+                          Frame 0 of each is assumed to already be time-aligned
+                          (e.g. both taken right after any warm-up spin-up) -
+                          ``hours`` is measured from each trajectory's own
+                          frame 0.
+    var                 : variable name (see _VAR_INFO), e.g. 'pv'.
+    hours               : sequence of times (hours since frame 0) to plot as columns.
+    output_path         : where to save the figure.
+    """
+    label, cmap_name = _VAR_INFO.get(var, (var, "coolwarm"))
+    rows = [(ref_label, ref_data), (inf_label, inf_data)]
+    n_cols = len(hours)
+
+    # Reconstruct only the requested frames (not the whole trajectory).
+    fields = {}
+    extents = {}  # row_idx -> [lon_min, lon_max, lat_min, lat_max] (degrees)
+    for row_idx, (_, data) in enumerate(rows):
+        solver, trajectory, lats, lons, sec_per_frame = _common_setup(data)
+        lons_c, lon_order = _center_longitudes(lons)
+        extents[row_idx] = [np.degrees(lons_c[0]), np.degrees(lons_c[-1]),
+                            np.degrees(lats[-1]), np.degrees(lats[0])]
+
+        dev = solver.lap.device
+        n_frames = trajectory.shape[0]
+        for col_idx, h in enumerate(hours):
+            frame_idx = int(round(h * 3600.0 / sec_per_frame))
+            if frame_idx >= n_frames:
+                print(f"⚠️  t={h}h (frame {frame_idx}) is past the end of the "
+                      f"'{rows[row_idx][0]}' trajectory ({n_frames} frames); using the last frame.")
+                frame_idx = n_frames - 1
+            with torch.no_grad():
+                field = _field_from_uspec(solver, trajectory[frame_idx].to(dev), var, _cache={})
+            fields[(row_idx, col_idx)] = field.detach().cpu().numpy()[:, lon_order]
+
+    ref_data0 = _field_from_uspec(solver, ref_data['trajectory'][0].to(dev), var, _cache={}).cpu().numpy()
+    vmin, vmax = float(np.percentile(ref_data0, 2)), float(np.percentile(ref_data0, 98)) # normalize color map using only reference data
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap(cmap_name)
+
+    if figsize is None:
+        figsize = (5.0 * n_cols, 7.0)
+    fig, axes = plt.subplots(2, n_cols, figsize=figsize)
+    axes = np.atleast_2d(axes).reshape(2, n_cols)
+
+    for row_idx, (row_label, _) in enumerate(rows):
+        extent = extents[row_idx]
+        for col_idx, h in enumerate(hours):
+            ax = axes[row_idx, col_idx]
+            ax.imshow(fields[(row_idx, col_idx)], origin="lower", extent=extent,
+                     aspect="auto", norm=norm, cmap=cmap, interpolation="bilinear")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if row_idx == 0:
+                ax.set_title(f"t = {h:g}h", fontsize=16)
+        axes[row_idx, 0].set_ylabel(row_label, fontsize=16)
+
+    fig.subplots_adjust(left=0.05, right=0.92, top=0.90, bottom=0.03,
+                        wspace=0.05, hspace=0.1)
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6, pad=0.02, label=label)
+    fig.suptitle(f"{label}: {ref_label} vs {inf_label}", fontsize=18)
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"📸 Saved box comparison plot -> {output_path}")
+
+
 def animate_uv_quiver_on_box(data,
                              output_dir, 
                              file_name="uv_quiver", 

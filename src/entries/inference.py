@@ -44,7 +44,7 @@ from torch_harmonics.sht import RealVectorSHT
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.numerical_solver.initial_condition import *
 from src.neural_operator.loss import LOSS_FUNCTIONS
-from src.analyze.visualization import plot_sphere_comparison
+from src.analyze.visualization import plot_sphere_comparison, plot_box_comparison
 from src.helpers.run_model import (
     run,
     neural_model_path,
@@ -75,17 +75,12 @@ DEFAULT_CONFIG = {
     "single_step": True,
     # rollout
     "duration": 20,                 # days
-    # save_interval_minutes is not a config input (see load_config): this
-    # pipeline only ever targets PS-solver-generated training data (30 min
-    # native cadence), so it's derived as n_future * 30 - the finest legal
-    # rollout cadence (one save per model step) - rather than left free to
-    # drift out of sync with n_future.
     # initial condition
     "ic": "galewsky",               # galewsky | real_world
     "dataset_name": None,           # required when ic == real_world, e.g. "1980_2025_odd_month"
     "ic_time": None,                # required when ic == real_world
     "pressure": None,               # required when ic == real_world (for naming)
-    "spinup_days": 1.0,
+    "spinup_days": 2.0,
 }
 
 
@@ -304,20 +299,36 @@ def main():
     )
 
     # ------------------------------------------------------------------ #
-    # (4) 2x4 sphere-projection comparison: rows = (reference, SFNO), columns
-    #     = t=0/1/2/6 hours since each trajectory's own frame 0 (i.e. since
-    #     the end of the warm-up spin-up). ref_traj is offset by
-    #     warmup_frames so both trajectories' frame 0 is the same absolute time.
+    # (4) 2x4 comparison, sphere and box projections: rows = (reference,
+    #     SFNO), columns = t=0/1/2/6 hours since each trajectory's own frame 0
+    #     (i.e. since the end of the warm-up spin-up). ref_traj is offset by
+    #     warmup_frames so both trajectories' frame 0 is the same absolute
+    #     time. Both calls plot the identical selection - only the projection
+    #     differs (plot_box_comparison is plot_sphere_comparison's flat
+    #     lon/lat counterpart, see visualization.py).
     # ------------------------------------------------------------------ #
     neural_data = torch.load(neural_save_path, weights_only=False)
     ref_data = torch.load(ref_save_path, weights_only=False)
+
+    comparison_hours = [0, int(1 * cfg.save_interval_minutes // 60),
+                        int(2 * cfg.save_interval_minutes // 60), int(4 * cfg.save_interval_minutes // 60)]
 
     plot_sphere_comparison(
         ref_data=ref_data,
         inf_data=neural_data,
         var="pv",
-        hours=[0, 6, 12, 24],
+        hours=comparison_hours,
         output_path=str(data_dir / f"{Path(data_file).stem}_sphere_comparison.png"),
+        ref_label="Numerical (ground truth)",
+        inf_label="SFNO (inference)",
+    )
+
+    plot_box_comparison(
+        ref_data=ref_data,
+        inf_data=neural_data,
+        var="pv",
+        hours=comparison_hours,
+        output_path=str(data_dir / f"{Path(data_file).stem}_box_comparison.png"),
         ref_label="Numerical (ground truth)",
         inf_label="SFNO (inference)",
     )
