@@ -585,7 +585,10 @@ def plot_box_comparison(ref_data, inf_data, var, hours, output_path,
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    # dpi (not solver/grid resolution) - box comparison plots are a plain
+    # imshow of the already-reconstructed field, so a higher dpi is cheap
+    # here (unlike plot_sphere_comparison's 3D surfaces).
+    fig.savefig(output_path, dpi=400, bbox_inches="tight")
     plt.close(fig)
     print(f"📸 Saved box comparison plot -> {output_path}")
 
