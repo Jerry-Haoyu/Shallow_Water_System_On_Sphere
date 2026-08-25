@@ -422,3 +422,12 @@ teacher.
 to confirm this resolves the observed forgetting in practice (not just in
 the isolated math check above).
 
+**Additional incongruence found (same investigation)**: `SWEMultiStepDataset.step_window`
+started at `0` instead of `SWEDataset`'s `(warmup_steps, ...)` - multistep
+curriculum training was sampling windows starting right at each trajectory's
+spin-up/edge effects, something single-step training deliberately avoids.
+Fixed with the same `save_interval_minutes`-aware warmup formula (see
+`dataset.py`'s `SWEDataset`), verified against both ERA5-direct (60 min
+cadence -> `warmup_steps=48`) and PS-solver (30 min cadence ->
+`warmup_steps=96`) data.
+
