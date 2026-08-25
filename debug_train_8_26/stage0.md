@@ -366,3 +366,59 @@ subtask 2) is the natural next step to get a real read on model quality.
   pinned to `1.0` accordingly (an earlier draft of this pin incorrectly
   guessed `0.5` before this check).
 
+### train_multistep.py: architecture incongruent with single-step training (catastrophic forgetting)
+User-reported symptom: the multi-step curriculum (`make train_multi`) appeared
+to catastrophically forget whatever the pretrained single-step checkpoint
+already knew. Root cause was two compounding bugs, on top of the
+`inner_skip`/`hard_thresholding_fraction` gaps fixed just above:
+
+1. **`_build_model()`'s `residual_prediction` was a freely-settable
+   `train_multi.residual_prediction` config value, not read from the source
+   checkpoint.** `residual_prediction` adds no extra learnable parameters (it
+   only toggles a `+input` in `forward()`), so a mismatch doesn't fail
+   `load_state_dict()` the way `inner_skip`/`hard_thresholding_fraction`
+   mismatches do - it silently reconstructs a model whose `forward()`
+   behaves differently than what the loaded weights were actually trained
+   under. Concretely: `config.yml` had `train_multi.residual_prediction:
+   False` while the actual source checkpoint (`nfuture_24/embed_256/index 0`)
+   used `residual_prediction: True`.
+
+2. **`_rollout_teacher` and the loss computation hardcoded *opposite*,
+   mutually exclusive assumptions about what `self.teacher(state)`/
+   `self.student(x)`'s raw output represents, and neither was
+   target_mode-aware:**
+   - `_rollout_teacher`: `state += self.teacher(state)` - assumed the output
+     is a **delta** to add to `state`.
+   - `_run_stage_epoch`: `loss(self.student(x), target)` - compared the
+     output **directly** against the absolute target, assuming it already
+     **is** the absolute state.
+
+   These can't both be correct under one `residual_prediction`/`target_mode`
+   setting (see the target_mode fix in `run_model.py`'s `run()`, same class
+   of bug). Whichever one was wrong fed the student either a diverging
+   rollout or a nonsensical loss signal (comparing a small delta against a
+   full-magnitude state or vice versa) - either would rapidly wreck weights
+   inherited from single-step pretraining. Verified in isolation: replaying
+   the old hardcoded `state += teacher(state)` against a toy "perfect"
+   absolute-output teacher over 3 steps diverges to `[13.4, 20.2, 27.1]`
+   against a true trajectory of `[3.4, 4.2, 4.9]` - roughly doubling the
+   state each step, exactly the shape of the reported symptom.
+
+**Fix**: `SFNOMultiStepTrainer.__init__` now derives
+`self.residual_prediction`/`self.target_mode` from `self.source_info`
+(the pretrained single-step checkpoint's own `model_info.json`) instead of
+accepting them as independent constructor/config parameters - removed
+`residual_prediction` from `SFNOMultiStepTrainer.__init__`,
+`DEFAULT_CONFIG`, and `config.yml`'s `train_multi:` section entirely,
+matching how `normalization_layer`/`loss_type`/`hard_thresholding_fraction`/
+`inner_skip` are already sourced. `_rollout_teacher` and `_run_stage_epoch`'s
+loss computation now both branch on `self.target_mode` (add the raw output to
+the input when `'residual'`, use it directly when `'absolute'`) instead of
+hardcoding one assumption. Verified the corrected formula reproduces the true
+trajectory exactly under both `target_mode` values against the same toy
+teacher.
+
+**Status: fixed, not yet re-run.** A fresh `make train_multi` run is needed
+to confirm this resolves the observed forgetting in practice (not just in
+the isolated math check above).
+

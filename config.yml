@@ -75,13 +75,13 @@ inference:
   normalization_layer: "layer_norm"  # must match the trained run's own value
   loss_type: "grid"        # must match the trained run's own value
   index: 0        # 0/, 1/, ... training-config slot
-  single_step: True
+  single_step: False
   # rollout
   duration: 3                # days
   # initial condition
   ic: "real_world"               # galewsky | real_world
   dataset_name: "1995_2025_(1,7,11)_(1,5,10,15)_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
-  ic_time: "2025-01-15T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
+  ic_time: "2023-05-15T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
   pressure: "500"           # required when ic == real_world (for naming), e.g. 500
   spinup_days: 2
 
@@ -133,16 +133,20 @@ train_single:
 train_multi:
   nlat: 128
   nlon: 256
-  n_future: 6
+  n_future: 24
   num_layers: 4
-  embed_dim: 128
+  embed_dim: 256
   pos_embed: "none"
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
-  normalization_layer: "none"  # must match the single-step run's own value
+  normalization_layer: "layer_norm"  # must match the single-step run's own value
   loss_type: "grid"        # must match the single-step run's own value
   index: 0                     # 0/, 1/, ... training-config slot (must already hold checkpoints_single.pt)
   scale_factor: 3
-  residual_prediction: True
+  # residual_prediction/target_mode removed - read from the source
+  # single-step checkpoint's own model_info.json, not independently
+  # configurable here (see stage0.md Findings: this being freely settable
+  # caused catastrophic forgetting when it silently didn't match the source
+  # checkpoint's actual value).
   # curriculum data: point at a dataset_<name>/ leaf (same convention as
   # train_single's training_data_dir) whose trajectories are long enough for
   # max_subsequent_steps * n_future + 1 frames - can be a longer-duration
@@ -154,12 +158,12 @@ train_multi:
   # whether to cache each file in host RAM after its first load instead of
   # re-reading it from disk every epoch (see dataset.py's SWEMultiStepDataset).
   # Only cheap to raise samples_per_file above 1 when cache_in_memory is True.
-  samples_per_file: 1
+  samples_per_file: 40
   cache_in_memory: true
-  batch_size: 64
-  lr: 2e-4
+  batch_size: 16
+  lr: 2e-3
   weight_decay: 0.01
-  validation_cadence: 5
+  validation_cadence: 10
   warmup_epochs: 0
   warmup_start_factor: 0.01
   restart: False

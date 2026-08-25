@@ -73,7 +73,6 @@ class SFNOMultiStepTrainer:
         index,
         max_subsequent_steps,
         scale_factor=1,
-        residual_prediction=True,
         normalization_layer="none",
         loss_type="spectral",
         samples_per_file=1,
@@ -90,7 +89,6 @@ class SFNOMultiStepTrainer:
         self.pos_embed = pos_embed
         self.grid = grid
         self.scale_factor = scale_factor
-        self.residual_prediction = residual_prediction
         self.max_subsequent_steps = max_subsequent_steps
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -128,6 +126,19 @@ class SFNOMultiStepTrainer:
         self.dataset_name = self.source_info.get("dataset_name")
         self.pressure = self.source_info.get("pressure")
 
+        # residual_prediction/target_mode are NOT independently configurable
+        # here (unlike e.g. epochs_per_stage) - they govern what the source
+        # checkpoint's forward() output actually represents (see
+        # _rollout_teacher/_run_stage_epoch below), and residual_prediction
+        # adds no extra learnable parameters, so a mismatch from what this
+        # checkpoint was actually trained with wouldn't even fail
+        # load_state_dict() - it would silently corrupt curriculum training
+        # instead (see stage0.md Findings: this caused catastrophic
+        # forgetting when train_multi.residual_prediction independently
+        # defaulted to a different value than the source checkpoint's own).
+        self.residual_prediction = self.source_info.get("residual_prediction", True)
+        self.target_mode = self.source_info.get("target_mode", "absolute")
+
         # non-dimensionalization scales come from the pretrained model itself
         # (README: checkpoints are self-describing) rather than being
         # recomputed from training_data_dir, so the student/teacher keep
@@ -160,7 +171,7 @@ class SFNOMultiStepTrainer:
             return SFNO(
                 img_size=(nlat, nlon), grid=grid,
                 num_layers=num_layers, scale_factor=scale_factor, embed_dim=embed_dim,
-                residual_prediction=residual_prediction,
+                residual_prediction=self.residual_prediction,
                 # read off the pretrained single-step checkpoint's own record
                 # (like normalization_layer below), not a separate train_multi
                 # config knob: student/teacher both load_state_dict() straight
@@ -302,6 +313,8 @@ class SFNOMultiStepTrainer:
                 f"validation_cadence = {validation_cadence}",
                 f"normalization_layer = {self.source_info.get('normalization_layer', 'none')} "
                 f"| loss_type = {self.source_info.get('loss_type', 'spectral')}",
+                f"residual_prediction = {self.residual_prediction} | target_mode = {self.target_mode} "
+                f"(read from the source checkpoint, not independently configurable here)",
                 f"samples_per_file = {self.samples_per_file} | cache_in_memory = {self.cache_in_memory}",
                 f"source single-step checkpoint = {self.run_dir}",
             ]
@@ -425,12 +438,21 @@ class SFNOMultiStepTrainer:
 
     def _rollout_teacher(self, obs1, steps):
         """Frozen teacher, `steps` autoregressive calls starting from obs1
-        (steps == 0 returns obs1 itself, i.e. teacher_step == 1)."""
+        (steps == 0 returns obs1 itself, i.e. teacher_step == 1).
+
+        self.target_mode governs what self.teacher(state) actually returns:
+        'absolute' - already the next state (residual_prediction=True added
+        the input back on inside forward() itself); 'residual' - a bare
+        delta that must be added to state here. Branching unconditionally on
+        one of these (this used to always do state += ...) silently breaks
+        the other case - see stage0.md Findings.
+        """
         state = obs1
         if steps > 0:
             with torch.no_grad():
                 for _ in range(steps):
-                    state += self.teacher(state)
+                    out = self.teacher(state)
+                    state = out if self.target_mode == "absolute" else state + out
         return state
 
     def _run_stage_epoch(self, loader, curr_step, train, optimizer=None):
@@ -450,8 +472,18 @@ class SFNOMultiStepTrainer:
 
             teacher_output = self._rollout_teacher(obs1, teacher_step - 1)
 
-            multi_step_prd = self.student(teacher_output)
-            single_step_prd = self.student(obs2)
+            # same target_mode branching as _rollout_teacher above: the
+            # student's raw output only IS the prediction directly comparable
+            # to `target` when target_mode == 'absolute' - otherwise it's a
+            # delta relative to the student's own input and must be added
+            # back first.
+            multi_step_out = self.student(teacher_output)
+            single_step_out = self.student(obs2)
+            if self.target_mode == "absolute":
+                multi_step_prd, single_step_prd = multi_step_out, single_step_out
+            else:
+                multi_step_prd = teacher_output + multi_step_out
+                single_step_prd = obs2 + single_step_out
 
             multi_step_loss = self.loss(self.solver, multi_step_prd, target, relative=True, squared=False)
             single_step_loss = self.loss(self.solver, single_step_prd, target, relative=True, squared=False)
@@ -630,7 +662,11 @@ def main():
         "num_layers": 4,
         "scale_factor": 1,
         "embed_dim": 16,
-        "residual_prediction": True,
+        # NOT a config key: residual_prediction (and target_mode) are read
+        # from the pretrained single-step checkpoint's own model_info.json
+        # inside SFNOMultiStepTrainer.__init__ - see stage0.md Findings for
+        # why letting this be independently configured here caused
+        # catastrophic forgetting.
         "pos_embed": "learnable lat",
         "trainData": "equiangular",
         "grid": "equiangular",
@@ -701,7 +737,6 @@ def main():
         index=train_config.index,
         max_subsequent_steps=train_config.max_subsequent_steps,
         scale_factor=train_config.scale_factor,
-        residual_prediction=train_config.residual_prediction,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,
         samples_per_file=train_config.samples_per_file,
