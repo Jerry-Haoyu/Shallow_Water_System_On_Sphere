@@ -296,4 +296,47 @@ during training, so this is not a rigorously held-out test period). Output:
   done in this stage given time/CDS-download constraints (see subtask 2's
   "deliberately scoped small first" note above).
 
+### Inference rollout bug found: target_mode wasn't applied (supersedes results above)
+While threading `target_mode` into `model_info.json`/`_architecture_signature()`
+(see the target_mode entry above), found that `run_model.py`'s `run()` never
+used it: the neural rollout loop was hardcoded to
+`state = model(state.unsqueeze(0)).squeeze(0)` - i.e. it always treated the
+model's raw output as the next absolute state. That's only correct for
+`target_mode="absolute"` (`residual_prediction=True`, where the model's own
+`forward()` already adds the input back on internally). For
+`target_mode="residual"` (`residual_prediction=False` - what **both** subtask
+1's and subtask 2's already-finished checkpoints actually used, since
+`target_mode` didn't exist yet when they were trained), the model's raw output
+is a bare delta `(u_next - u_curr)`; feeding it straight in as the new `state`
+silently discards the real state every step and replaces it with a
+near-zero-magnitude delta, rather than integrating one forward.
+
+**This means the "Inference" results recorded just above this section - for
+both subtasks - were generated under the broken rollout and should be treated
+as unreliable, not as a real measurement of either subtask's model quality.**
+In particular this is a strong alternative explanation for subtask 2's
+puzzling "good qualitative look, ~60-90% quantitative error" discrepancy noted
+above - a rollout that's discarding state every step would visually still
+produce *some* physically-textured-looking field (from the network's own
+inductive biases) while being quantitatively almost meaningless.
+
+**Fix**: `run()` now reads `target_mode = model_info.get('target_mode',
+'residual')` and branches: `state = out` if `absolute`, `state = state + out`
+if `residual`. Default `'residual'` matches `SWEDataset`'s own class default,
+so this correctly retro-fixes both existing checkpoints (their `model_info.json`
+predates the key entirely) with no metadata patch needed - unlike
+`hard_thresholding_fraction`, whose old hardcoded value (`0.5`) didn't match
+the new default and did need patching.
+
+**No new config.yml key was added.** `target_mode` isn't part of
+`neural_model_path`'s directory-naming convention (unlike nlat/n_future/
+embed_dim/...), so `inference.py`'s config doesn't need to specify it - `run()`
+reads it straight from the resolved checkpoint's own `model_info.json`, the
+same self-describing-checkpoint pattern already used for T/U/
+save_interval_minutes/residual_prediction/inner_skip/hard_thresholding_fraction.
+
+**Status: fix implemented, not yet re-run.** Re-running inference for both
+subtasks (`make inference` for subtask 1, `inference_era5_direct.py` for
+subtask 2) is the natural next step to get a real read on model quality.
+
 

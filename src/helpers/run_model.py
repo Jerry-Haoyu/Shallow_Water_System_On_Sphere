@@ -540,6 +540,14 @@ def run(model_checkpoint,
         }
         print_in_box(run_log_content)
 
+        # SWEDataset's own target framing this checkpoint was trained against
+        # (dataset.py's SWEDataset default is 'residual' - see stage0.md
+        # Findings): 'absolute' means the model's forward() already adds the
+        # input state back on (residual_prediction=True), so its raw output
+        # IS the next state; 'residual' means forward() outputs a bare delta
+        # that the rollout below must add to the current state itself.
+        target_mode = model_info.get('target_mode', 'residual')
+
         model = SFNO(
             img_size=(nlat, nlon), grid=grid,
             num_layers=model_info['num_layers'],
@@ -579,7 +587,14 @@ def run(model_checkpoint,
                 trajectory[i] = _nondim_to_physical(solver.grid2spec(state), T, U).cpu()
                 if i < number_of_frames - 1:
                     for _ in range(model_steps_per_save):
-                        state += model(state.unsqueeze(0)).squeeze(0)
+                        out = model(state.unsqueeze(0)).squeeze(0)
+                        # 'absolute': out already IS the next state (model's
+                        # own residual_prediction skip added state back on
+                        # internally). 'residual': out is a bare delta - add
+                        # it here, or the rollout silently discards state and
+                        # replaces it with a near-zero-magnitude delta every
+                        # step (see stage0.md Findings).
+                        state = out if target_mode == 'absolute' else state + out
         end_sim_time = time.perf_counter()
         print(f"⏰ Finished model inference in {end_sim_time - start_sim_time:.3f} seconds")
         data = {
