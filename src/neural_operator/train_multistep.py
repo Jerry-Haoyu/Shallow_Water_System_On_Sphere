@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from src.helpers.print import *
-from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator as SFNO
+from src.neural_operator.sfno_model import SphericalFourierNeuralOperator as SFNO
 
 from src.neural_operator.dataset import SWEMultiStepDataset
 from src.neural_operator.loss import LOSS_FUNCTIONS
@@ -165,9 +165,13 @@ class SFNOMultiStepTrainer:
                 # (like normalization_layer below), not a separate train_multi
                 # config knob: student/teacher both load_state_dict() straight
                 # from that checkpoint just below, so the rebuilt architecture
-                # must match its global_conv.weight shape exactly or that call
-                # fails with a size mismatch (see stage0.md Findings).
+                # must match it exactly or that call fails - a size mismatch
+                # for hard_thresholding_fraction, or "unexpected key(s)" for
+                # inner_skip (needs src.neural_operator.sfno_model's subclass,
+                # not torch_harmonics's own SFNO, to even accept this kwarg -
+                # see stage0.md Findings).
                 hard_thresholding_fraction=self.source_info.get("hard_thresholding_fraction", 1.0),
+                inner_skip=self.source_info.get("inner_skip", "none"),
                 pos_embed=pos_embed, use_mlp=True,
                 normalization_layer=self.source_info.get("normalization_layer", "none"),
             ).to(self.device)
