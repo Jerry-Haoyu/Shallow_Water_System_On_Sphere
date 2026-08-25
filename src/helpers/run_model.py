@@ -544,16 +544,12 @@ def run(model_checkpoint,
         # 'absolute' means the model's forward() already adds the input state
         # back on (residual_prediction=True), so its raw output IS the next
         # state; 'residual' means forward() outputs a bare delta that the
-        # rollout below must add to the current state itself.
-        #
-        # Fallback 'residual' (NOT SWEDataset's current default, which is now
-        # 'absolute' - see stage0.md Findings) is deliberately kept here: a
-        # missing key means this checkpoint predates target_mode existing at
-        # all, and every such checkpoint was actually trained under the old
-        # implicit 'residual' behavior. Changing this fallback to 'absolute'
-        # would silently reintroduce the exact rollout bug this branch fixes,
-        # for every pre-existing checkpoint.
-        target_mode = model_info.get('target_mode', 'residual')
+        # rollout below must add to the current state itself. Fallback
+        # 'absolute' matches SWEDataset's/SFNOSingleStepTrainer's current
+        # default - a checkpoint trained before target_mode existed (i.e.
+        # under the old implicit 'residual' behavior) needs retraining anyway
+        # to get a correct rollout, per stage0.md Findings.
+        target_mode = model_info.get('target_mode', 'absolute')
 
         model = SFNO(
             img_size=(nlat, nlon), grid=grid,

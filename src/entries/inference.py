@@ -75,7 +75,11 @@ DEFAULT_CONFIG = {
     "single_step": True,
     # rollout
     "duration": 20,                 # days
-    "save_interval_minutes": 30,
+    # save_interval_minutes is not a config input (see load_config): this
+    # pipeline only ever targets PS-solver-generated training data (30 min
+    # native cadence), so it's derived as n_future * 30 - the finest legal
+    # rollout cadence (one save per model step) - rather than left free to
+    # drift out of sync with n_future.
     # initial condition
     "ic": "galewsky",               # galewsky | real_world
     "dataset_name": None,           # required when ic == real_world, e.g. "1980_2025_odd_month"
@@ -100,11 +104,14 @@ def load_config():
     raw["embed_dim"] = int(raw["embed_dim"])
     raw["index"] = int(raw["index"])
     raw["duration"] = float(raw["duration"])
-    raw["save_interval_minutes"] = float(raw["save_interval_minutes"])
     raw["spinup_days"] = int(raw['spinup_days'])
-
+    # not a config input - see the comment on DEFAULT_CONFIG's rollout section.
+    # Popped rather than left in raw so a stray inference.save_interval_minutes
+    # in a config file is silently overridden here, not silently kept.
+    raw.pop("save_interval_minutes", None)
 
     cfg = SimpleNamespace(**raw)
+    cfg.save_interval_minutes = cfg.n_future * 30.0
 
     if cfg.ic == "real_world":
         if not cfg.ic_time:

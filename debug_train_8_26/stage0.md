@@ -339,4 +339,30 @@ save_interval_minutes/residual_prediction/inner_skip/hard_thresholding_fraction.
 subtasks (`make inference` for subtask 1, `inference_era5_direct.py` for
 subtask 2) is the natural next step to get a real read on model quality.
 
+### Follow-up cleanup (defaults + config exposure)
+- `run_model.py`'s `model_info.get('target_mode', 'residual')` inference
+  fallback changed to default `'absolute'` (matching `SWEDataset`'s/
+  `SFNOSingleStepTrainer`'s own defaults, both also flipped to `'absolute'`
+  this stage) - a checkpoint with no `target_mode` key now needs retraining
+  to get a correct rollout rather than being silently reinterpreted as
+  `'residual'`, per explicit instruction to not preserve old-checkpoint
+  compatibility here.
+- `inference.py` no longer takes `save_interval_minutes` as a config input -
+  this pipeline only ever targets PS-solver-generated data (30 min native
+  cadence), so it's now derived as `n_future * 30` (the finest legal rollout
+  cadence) instead of a free-standing knob that could drift out of sync with
+  `n_future`. Removed from `config.yml`'s `inference:` section (was `180`,
+  same as `6 * 30` - no behavior change for that run).
+- `hard_thresholding_fraction` added explicitly to both training pipelines'
+  configs (`config.yml`'s `train_single:` and
+  `debug_train_8_26/config_train_era5_direct.yml`'s `train_single:`) for
+  visibility, rather than relying silently on `train_singlestep.py`'s
+  `DEFAULT_CONFIG` fallback. Verified each existing checkpoint's *actual*
+  trained value directly off its weights (`blocks.0.global_conv.weight`'s
+  last dim: 42 = full modes = `1.0`, 21 = half = `0.5`) rather than assuming:
+  both subtask 1's and subtask 2's original checkpoints trained **before**
+  `hard_thresholding_fraction` was even hardcoded to `0.5` elsewhere, so both
+  actually used the untouched default `1.0` - config_train_era5_direct.yml is
+  pinned to `1.0` accordingly (an earlier draft of this pin incorrectly
+  guessed `0.5` before this check).
 

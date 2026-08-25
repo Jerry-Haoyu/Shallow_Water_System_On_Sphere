@@ -68,17 +68,16 @@ inference:
   nlon: 256
   n_future: 6
   num_layers: 4
-  embed_dim: 128
+  embed_dim: 256
   pos_embed: "none"
   trainData: "1980_2025_odd_month_500"
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
-  normalization_layer: "none"  # must match the trained run's own value
+  normalization_layer: "layer_norm"  # must match the trained run's own value
   loss_type: "grid"        # must match the trained run's own value
-  index: 2                # 0/, 1/, ... training-config slot
+  index: 3            # 0/, 1/, ... training-config slot
   single_step: True
   # rollout
   duration: 3                # days
-  save_interval_minutes: 180
   # initial condition
   ic: "real_world"               # galewsky | real_world
   dataset_name: "1980_2025_odd_month_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
@@ -89,8 +88,8 @@ inference:
 train_single:
   # The training set directory
   training_data_dir: "model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500/"
-  batch_size: 128
-  lr: 8e-4
+  batch_size: 32
+  lr: 2e-3
   n_future: 48
   # model architecture
   num_layers: 4         # number of SFNO layers
@@ -99,26 +98,25 @@ train_single:
   # happens inside the SFNO blocks), but builds the embedding buffer at the
   # *downsampled* (scale_factor>1) resolution 
   scale_factor: 3          # downsampling ratio
-  embed_dim: 128            # up-projection from 3 channels
-  # dbg_8_26_stage_0 architecture fix (see debug_train_8_26/stage0.md Findings):
-  # residual_prediction=False since targets are already (u_next-u_curr) deltas;
-  # inner_skip="linear" is the previously-unreachable per-block skip.
-  residual_prediction: False
+  embed_dim: 256            # up-projection from 3 channels
+  residual_prediction: True
+  target_mode: "absolute" # if set to residual that predict u_next - u_curr, elif sbsolution predict u_next
   inner_skip: "linear"
+  # fraction of spherical-harmonic modes each block's global_conv keeps (1.0 =
+  # all modes, torch_harmonics's own default). Must match between a checkpoint
+  # and the model rebuilt to load it - run_model.py reads this back from
+  # model_info.json, so it's safe to change between runs (each lands in its
+  # own architecture-signature index). See stage0.md Findings.
+  hard_thresholding_fraction: 1.0
   pos_embed: "none"  # positional embedding before SFNO layers
   normalization_layer: "layer_norm"  # none | layer_norm | instance_norm (applied inside each SFNO block)
   loss_type: "grid"  # grid | spectral (see src/neural_operator/loss.py's LOSS_FUNCTIONS)
-  # dbg_8_26_stage_0 I/O speedup (see stage0.md Findings): cache each ~189MB
-  # trajectory file in host RAM after its first load instead of re-reading it
-  # from disk every epoch (~52GB total for this directory's 276 files - the
-  # slurm script's --mem must cover this), and draw samples_per_file
-  # independent random windows from each cached file per epoch instead of 1.
-  samples_per_file: 10
-  cache_in_memory: true
-  epochs: 3000
-  weight_decay: 0.05
-  validation_cadence: 100
-  warmup_epochs: 100
+  samples_per_file: 20
+  cache_in_memory: true # if true cache trajectories to host memory upon first epoch
+  epochs: 50
+  weight_decay: 0.01
+  validation_cadence: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.001 
   restart: False
   restart_period: 20
@@ -127,7 +125,7 @@ train_single:
   # if true, search 0/, 1/, ... for a run with this same architecture (training
   # hyperparameters need not match) and continue training it; if false, always
   # start a brand new run from scratch.
-  continue: True
+  continue: False
 
 # configuration for make train_multi (teacher/student multi-step curriculum
 # fine-tuning on top of an already-trained single-step run - see

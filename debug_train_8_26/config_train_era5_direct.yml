@@ -29,6 +29,13 @@ train_single:
   # what the existing subtask-2 checkpoint was actually trained with.
   target_mode: "residual"
   inner_skip: "linear"
+  # pinned explicitly for documentation, matching what this checkpoint was
+  # actually trained with: subtask 2 finished training before
+  # hard_thresholding_fraction was even hardcoded to 0.5 elsewhere (let alone
+  # threaded through as a config knob), so its SFNO call never passed it at
+  # all - verified against the checkpoint's own weights (global_conv.weight's
+  # last dim is 42, the full mode count, not 21). See stage0.md Findings.
+  hard_thresholding_fraction: 1.0
   pos_embed: "none"
   normalization_layer: "layer_norm"
   loss_type: "grid"
