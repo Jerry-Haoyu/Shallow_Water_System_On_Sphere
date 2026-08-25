@@ -241,7 +241,8 @@ class SFNOMultiStepTrainer:
         validation_cadence,
         continue_training,
     ):
-        self.total_epochs = self.max_subsequent_steps * epochs_per_stage
+        self.epochs_per_stage = epochs_per_stage
+        self.total_epochs = self.max_subsequent_steps * self.epochs_per_stage
 
         run_log_dir = self.run_dir.replace(self.CHECKPOINT_ROOT, self.LOG_ROOT, 1)
         os.makedirs(self.run_dir, exist_ok=True)
@@ -457,7 +458,15 @@ class SFNOMultiStepTrainer:
 
     def _run_stage_epoch(self, loader, curr_step, train, optimizer=None):
         """One pass over `loader` at curriculum stage `curr_step`; returns the
-        mean (multi_step_loss + single_step_loss)."""
+        mean of (multi_step_loss + single_step_loss) / 2 - averaging the two
+        terms (rather than summing them) purely for logging comparability
+        with train_singlestep.py's single-term loss: at curr_step == 1,
+        teacher_step is forced to 1, which makes multi_step_loss and
+        single_step_loss numerically identical (see class docstring), so an
+        unaveraged sum reads exactly 2x train_singlestep.py's own loss for an
+        architecturally-equivalent computation. Cosmetic only - loss.backward()
+        below still uses the full (unaveraged) sum, so training dynamics are
+        unchanged."""
         self.student.train(train)
         total_loss, n_batches = 0.0, 0
         torch.set_grad_enabled(train)
@@ -495,7 +504,10 @@ class SFNOMultiStepTrainer:
                 loss.backward()
                 optimizer.step()
 
-            total_loss += loss.item()
+            # /2 here only, not on `loss` above - backward() already ran on
+            # the full sum, so gradients/training dynamics are untouched;
+            # only the logged/returned value is rescaled for comparability.
+            total_loss += loss.item() / 2
             n_batches += 1
         torch.set_grad_enabled(True)
         return total_loss / max(n_batches, 1)
@@ -511,7 +523,14 @@ class SFNOMultiStepTrainer:
             main = sched.CosineAnnealingWarmRestarts(
                 optimizer, T_0=t0, T_mult=restart_mult)
         else:
-            main = sched.CosineAnnealingLR(optimizer, T_max=remaining)
+            main = sched.SequentialLR(
+                optimizer, 
+                schedulers=[
+                    sched.ConstantLR(optimizer, factor=1e-1, total_iters=self.epochs_per_stage), # for stage 1 training(single-step), pervent catstrophic forgetting
+                    sched.ConstantLR(optimizer, factor=1.0, total_iters=remaining-self.epochs_per_stage)
+                ],
+                milestones=[self.epochs_per_stage]
+            )
 
         if warmup_epochs > 0:
             warmup = sched.LinearLR(
