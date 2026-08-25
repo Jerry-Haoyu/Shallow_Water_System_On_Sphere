@@ -234,15 +234,26 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
             # discarding and re-reading it in __getitem__.
             self._cache[self.file_list[0]] = first["trajectory"]
 
+        # minutes between consecutive saved frames - same field SWEDataset
+        # reads, used the same way below (2-day warmup in units of this
+        # file's own frame cadence).
+        self.save_interval_minutes = metadata.get("save_interval_minutes", 30)
+
         self.window_frames = max_subsequent_steps * n_future + 1
         n_frames = first["trajectory"].shape[0]
         print(f"💿 SWE Multi-Step Dataset: n_frames={n_frames}, window_frames={self.window_frames} "
               f"(max_subsequent_steps={max_subsequent_steps}, n_future={n_future})")
-        self.step_window = (0, n_frames - self.window_frames)
+        # Only sample after a 2-day warmup, skipping the file's own
+        # spin-up/edge effects - same reasoning and formula as SWEDataset's
+        # step_window (dataset.py), previously missing here entirely (this
+        # class started sampling from step 0).
+        warmup_steps = max(1, round(2 * 24 * 60 / self.save_interval_minutes))
+        self.step_window = (warmup_steps, n_frames - self.window_frames)
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(
                 f"Trajectory of length {n_frames} is too short for max_subsequent_steps="
-                f"{max_subsequent_steps} at n_future={n_future} (needs >= {self.window_frames} frames)."
+                f"{max_subsequent_steps} at n_future={n_future} with a {warmup_steps}-step "
+                f"warmup (needs >= {warmup_steps + self.window_frames} frames)."
             )
 
     def __len__(self):
