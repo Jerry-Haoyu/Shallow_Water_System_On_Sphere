@@ -161,6 +161,13 @@ class SFNOMultiStepTrainer:
                 img_size=(nlat, nlon), grid=grid,
                 num_layers=num_layers, scale_factor=scale_factor, embed_dim=embed_dim,
                 residual_prediction=residual_prediction,
+                # read off the pretrained single-step checkpoint's own record
+                # (like normalization_layer below), not a separate train_multi
+                # config knob: student/teacher both load_state_dict() straight
+                # from that checkpoint just below, so the rebuilt architecture
+                # must match its global_conv.weight shape exactly or that call
+                # fails with a size mismatch (see stage0.md Findings).
+                hard_thresholding_fraction=self.source_info.get("hard_thresholding_fraction", 1.0),
                 pos_embed=pos_embed, use_mlp=True,
                 normalization_layer=self.source_info.get("normalization_layer", "none"),
             ).to(self.device)
