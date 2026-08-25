@@ -30,7 +30,7 @@ class SWEDataset(torch.utils.data.Dataset):
     All files are assumed to share the same solver configuration
     """
 
-    def __init__(self, simulation_data_dir, n_future, mode='residual', seed=None,
+    def __init__(self, simulation_data_dir, n_future, mode='absolute', seed=None,
                  samples_per_file=1, cache_in_memory=True):
         self.simulation_data_dir = simulation_data_dir
         self.nfuture = n_future

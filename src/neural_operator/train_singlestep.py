@@ -53,7 +53,7 @@ class SFNOSingleStepTrainer:
         loss_type='spectral',
         samples_per_file=1,
         cache_in_memory=True,
-        target_mode='residual',
+        target_mode='absolute',
         hard_thresholding_fraction=1.0,
     ):
         print("😗 😗 Starting SFNO Single Step Training 😗 😗 ".center(100))
