@@ -54,6 +54,7 @@ class SFNOSingleStepTrainer:
         samples_per_file=1,
         cache_in_memory=True,
         target_mode='residual',
+        hard_thresholding_fraction=1.0,
     ):
         print("😗 😗 Starting SFNO Single Step Training 😗 😗 ".center(100))
 
@@ -68,6 +69,15 @@ class SFNOSingleStepTrainer:
         self.embed_dim = embed_dim
         self.residual_prediction = residual_prediction
         self.inner_skip = inner_skip
+        # fraction of spherical-harmonic modes each block's global_conv keeps
+        # (torch_harmonics default 1.0 = all modes). Directly sizes
+        # global_conv.weight's last dimension, so it must match between a
+        # checkpoint and the model reconstructed to load it into - recorded
+        # below (_architecture_signature/model_info.json) and read back by
+        # run_model.py's inference-time reconstruction for exactly that
+        # reason (previously hardcoded to 0.5 here with no such record,
+        # breaking inference - see debug_train_8_26/stage0.md Findings).
+        self.hard_thresholding_fraction = hard_thresholding_fraction
         self.pos_embed = pos_embed
         self.normalization_layer = normalization_layer
         self.loss_type = loss_type
@@ -131,6 +141,7 @@ class SFNOSingleStepTrainer:
             num_layers=num_layers, scale_factor=scale_factor, embed_dim=embed_dim,
             residual_prediction=residual_prediction,
             inner_skip=inner_skip,
+            hard_thresholding_fraction=hard_thresholding_fraction,
             pos_embed=pos_embed, use_mlp=True,
             normalization_layer=self.normalization_layer,
         ).to(self.device)
@@ -167,6 +178,7 @@ class SFNOSingleStepTrainer:
             "pos_embed": self.pos_embed, "scale_factor": self.scale_factor,
             "embed_dim": self.embed_dim, "residual_prediction": self.residual_prediction,
             "inner_skip": self.inner_skip, "target_mode": self.target_mode,
+            "hard_thresholding_fraction": self.hard_thresholding_fraction,
             "normalization_layer": self.normalization_layer, "loss_type": self.loss_type,
             "training_data": self.training_data_dir,
         }
@@ -349,6 +361,7 @@ class SFNOSingleStepTrainer:
                 f"residual_prediction = {self.residual_prediction} : whole-network output += raw input",
                 f"inner_skip = {self.inner_skip} : per-block skip inside each SFNO block (none | linear | identity)",
                 f"target_mode = {self.target_mode} : SWEDataset target framing (residual: u_next-u_curr | absolute: u_next)",
+                f"hard_thresholding_fraction = {self.hard_thresholding_fraction} : fraction of spherical modes kept in each block's global_conv",
                 f"normalization_layer = {self.normalization_layer} : none | layer_norm | instance_norm",
                 f"loss_type = {self.loss_type} : grid | spectral",
                 f"dataset_name = {self.dataset_name} | pressure = {self.pressure}",
@@ -386,6 +399,7 @@ class SFNOSingleStepTrainer:
             "residual_prediction" : self.residual_prediction ,
             "inner_skip" : self.inner_skip ,
             "target_mode" : self.target_mode ,
+            "hard_thresholding_fraction" : self.hard_thresholding_fraction ,
             "normalization_layer" : self.normalization_layer ,
             "loss_type" : self.loss_type ,
             "run_index" : self.run_index ,
@@ -730,6 +744,13 @@ def main():
         # block, missing from torch_harmonics' public constructor (see
         # src/neural_operator/sfno_model.py and stage0.md Findings).
         "inner_skip" : "linear",
+        # fraction of spherical-harmonic modes each block's global_conv keeps
+        # (1.0 = torch_harmonics's own default, all modes). Must match between
+        # a checkpoint and the model rebuilt to load it (run_model.py reads
+        # this back from model_info.json) - see debug_train_8_26/stage0.md
+        # Findings for the inference breakage this caused when it was a bare
+        # hardcoded 0.5 with no such record.
+        "hard_thresholding_fraction" : 1.0,
         "pos_embed" : 'learnable lat',
         "normalization_layer" : "none",   # none | layer_norm | instance_norm
         "loss_type" : "spectral",         # grid | spectral (see loss.py's LOSS_FUNCTIONS)
@@ -767,6 +788,7 @@ def main():
     raw_train_cfg["batch_size"] = int(raw_train_cfg["batch_size"])
     raw_train_cfg["samples_per_file"] = int(raw_train_cfg["samples_per_file"])
     raw_train_cfg["cache_in_memory"] = bool(raw_train_cfg["cache_in_memory"])
+    raw_train_cfg["hard_thresholding_fraction"] = float(raw_train_cfg["hard_thresholding_fraction"])
 
     # "continue" is a Python keyword - can't be a SimpleNamespace attribute
     # accessed via dot syntax, so pull it out before the conversion below.
@@ -784,6 +806,7 @@ def main():
         residual_prediction=train_config.residual_prediction,
         inner_skip=train_config.inner_skip,
         target_mode=train_config.target_mode,
+        hard_thresholding_fraction=train_config.hard_thresholding_fraction,
         pos_embed=train_config.pos_embed,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,

@@ -547,6 +547,7 @@ def run(model_checkpoint,
             embed_dim=model_info['embed_dim'],
             residual_prediction=model_info.get('residual_prediction', True),
             inner_skip=model_info.get('inner_skip', 'none'),
+            hard_thresholding_fraction=model_info.get('hard_thresholding_fraction', 1.0),
             pos_embed=model_info['pos_embed'], use_mlp=True,
             normalization_layer=model_info.get('normalization_layer', 'none'),
         ).to(device)
