@@ -66,7 +66,7 @@ inference:
   # which trained model (locates the checkpoint via the convention)
   nlat: 128
   nlon: 256
-  n_future: 6
+  n_future: 24
   num_layers: 4
   embed_dim: 256
   pos_embed: "none"
@@ -74,15 +74,16 @@ inference:
   grid: "equiangular"          # equiangular | legendre-gauss | lobatto
   normalization_layer: "layer_norm"  # must match the trained run's own value
   loss_type: "grid"        # must match the trained run's own value
-  index: 3            # 0/, 1/, ... training-config slot
+  index: 0        # 0/, 1/, ... training-config slot
   single_step: True
   # rollout
   duration: 3                # days
   # initial condition
   ic: "real_world"               # galewsky | real_world
-  dataset_name: "1980_2025_odd_month_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
-  ic_time: "2025-07-01T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
-  pressure: "500"               # required when ic == real_world (for naming), e.g. 500
+  dataset_name: "1995_2025_(1,7,11)_(1,5,10,15)_500"    # required when ic == real_world; reanalysis_data/<dataset_name>/data.nc
+  ic_time: "2025-01-15T00:00:00"                # required when ic == real_world, e.g. 2000-07-01T00:00:00
+  pressure: "500"           # required when ic == real_world (for naming), e.g. 500
+  spinup_days: 2
 
 # configuration for make train_single
 train_single:
@@ -90,7 +91,7 @@ train_single:
   training_data_dir: "model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500/"
   batch_size: 32
   lr: 2e-3
-  n_future: 48
+  n_future: 24
   # model architecture
   num_layers: 4         # number of SFNO layers
   # scale_factor must stay 1 when pos_embed != "none": torch_harmonics's SFNO
@@ -102,12 +103,8 @@ train_single:
   residual_prediction: True
   target_mode: "absolute" # if set to residual that predict u_next - u_curr, elif sbsolution predict u_next
   inner_skip: "linear"
-  # fraction of spherical-harmonic modes each block's global_conv keeps (1.0 =
-  # all modes, torch_harmonics's own default). Must match between a checkpoint
-  # and the model rebuilt to load it - run_model.py reads this back from
-  # model_info.json, so it's safe to change between runs (each lands in its
-  # own architecture-signature index). See stage0.md Findings.
-  hard_thresholding_fraction: 1.0
+  # fraction of spherical-harmonic modes each block's global_conv keeps 
+  hard_thresholding_fraction: 0.5
   pos_embed: "none"  # positional embedding before SFNO layers
   normalization_layer: "layer_norm"  # none | layer_norm | instance_norm (applied inside each SFNO block)
   loss_type: "grid"  # grid | spectral (see src/neural_operator/loss.py's LOSS_FUNCTIONS)
@@ -152,7 +149,13 @@ train_multi:
   # dataset than the one used for single-step pretraining.
   training_data_dir: "model_output/numerical/resol_64/tau_(30000,2,2)/grid_eq/method_implicit/radiation_no_rad/duration_20/ic_rw/pressure_500/dataset_1980_2025_odd_month_500"
   max_subsequent_steps: 4      # curriculum rolls teacher_step from 1 up to this many single-step calls
-  epochs_per_stage: 50         # fixed epoch budget per curriculum stage 
+  epochs_per_stage: 50         # fixed epoch budget per curriculum stage
+  # independent random windows drawn from each trajectory file per epoch, and
+  # whether to cache each file in host RAM after its first load instead of
+  # re-reading it from disk every epoch (see dataset.py's SWEMultiStepDataset).
+  # Only cheap to raise samples_per_file above 1 when cache_in_memory is True.
+  samples_per_file: 1
+  cache_in_memory: true
   batch_size: 64
   lr: 2e-4
   weight_decay: 0.01

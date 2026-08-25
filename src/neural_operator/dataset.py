@@ -201,12 +201,23 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
     which curriculum stage's ``teacher_step`` is indexing into it.
     """
 
-    def __init__(self, simulation_data_dir, n_future, max_subsequent_steps, T, U):
+    def __init__(self, simulation_data_dir, n_future, max_subsequent_steps, T, U,
+                 samples_per_file=1, cache_in_memory=True):
         self.simulation_data_dir = simulation_data_dir
         self.n_future = n_future
         self.max_subsequent_steps = max_subsequent_steps
         self.T = T
         self.U = U
+
+        # see SWEDataset's identical knobs for the full rationale: draw this
+        # many independent random windows from each file per epoch (default
+        # 1, matching the old one-window-per-file behavior), and cache each
+        # file's full trajectory in host RAM after its first load instead of
+        # re-reading it from disk every epoch - only cheap to raise
+        # samples_per_file above 1 when cache_in_memory is also True.
+        self.samples_per_file = samples_per_file
+        self.cache_in_memory = cache_in_memory
+        self._cache = {} if cache_in_memory else None
 
         self.file_list = sorted(glob.glob(os.path.join(simulation_data_dir, "*.pt")))
         if not self.file_list:
@@ -218,6 +229,10 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
         self.solver = ShallowWaterSolver(lmax=metadata["lmax"], grid=metadata["grid"], dealias=False, non_dimensional=False)
         self.solver.to(self.solver.device)
         self.device = self.solver.device
+        if self.cache_in_memory:
+            # already loaded above (on CPU) for metadata - reuse it instead of
+            # discarding and re-reading it in __getitem__.
+            self._cache[self.file_list[0]] = first["trajectory"]
 
         self.window_frames = max_subsequent_steps * n_future + 1
         n_frames = first["trajectory"].shape[0]
@@ -231,17 +246,33 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
             )
 
     def __len__(self):
-        return len(self.file_list)
+        # samples_per_file independent random windows are drawn from each
+        # file per epoch (default 1) - see __init__ and __getitem__.
+        return len(self.file_list) * self.samples_per_file
 
-    def __getitem__(self, index):
-        file = self.file_list[index]
+    def _load_trajectory(self, file_idx):
+        """Return the (file_idx's) file's full spectral trajectory, on
+        self.device if uncached or on CPU if cached (see cache_in_memory).
+        Falls back to the next file in the list if loading fails."""
+        file = self.file_list[file_idx]
+        map_location = "cpu" if self.cache_in_memory else self.device
+        cache = self._cache if self.cache_in_memory else None
+
+        if cache is not None and file in cache:
+            return cache[file]
         try:
-            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+            uspec = torch.load(file, map_location=map_location, weights_only=False)["trajectory"]
         except Exception as e:
             print(f"Warning: failed to load {file}: {e}. Falling back to next file.")
-            fallback_index = (index + 1) % len(self.file_list)
-            file = self.file_list[fallback_index]
-            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+            fallback_idx = (file_idx + 1) % len(self.file_list)
+            return self._load_trajectory(fallback_idx)
+        if cache is not None:
+            cache[file] = uspec
+        return uspec
+
+    def __getitem__(self, index):
+        file_idx = index % len(self.file_list)
+        uspec = self._load_trajectory(file_idx)
 
         # pick a random starting step within the whole-trajectory window
         start = random.randint(self.step_window[0], self.step_window[1])

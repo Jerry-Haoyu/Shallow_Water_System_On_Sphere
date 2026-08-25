@@ -76,6 +76,8 @@ class SFNOMultiStepTrainer:
         residual_prediction=True,
         normalization_layer="none",
         loss_type="spectral",
+        samples_per_file=1,
+        cache_in_memory=True,
     ):
         print("🧑‍🏫 🧑‍🎓 Starting SFNO Multi-Step Curriculum Training 🧑‍🎓 🧑‍🏫".center(100))
         self.start_time = time.perf_counter()
@@ -135,9 +137,12 @@ class SFNOMultiStepTrainer:
         self.T = self.source_info["T"]
         self.U = self.source_info["U"]
 
+        self.samples_per_file = samples_per_file
+        self.cache_in_memory = cache_in_memory
         self.ds = SWEMultiStepDataset(
             simulation_data_dir=training_data_dir, n_future=n_future,
             max_subsequent_steps=max_subsequent_steps, T=self.T, U=self.U,
+            samples_per_file=samples_per_file, cache_in_memory=cache_in_memory,
         )
         if (self.ds.solver.nlat, self.ds.solver.nlon) != (nlat, nlon):
             raise ValueError(
@@ -286,6 +291,7 @@ class SFNOMultiStepTrainer:
                 f"validation_cadence = {validation_cadence}",
                 f"normalization_layer = {self.source_info.get('normalization_layer', 'none')} "
                 f"| loss_type = {self.source_info.get('loss_type', 'spectral')}",
+                f"samples_per_file = {self.samples_per_file} | cache_in_memory = {self.cache_in_memory}",
                 f"source single-step checkpoint = {self.run_dir}",
             ]
         }
@@ -323,6 +329,8 @@ class SFNOMultiStepTrainer:
             "restart_mult": restart_mult,
             "validation_cadence": validation_cadence,
             "training_data_dir": self.training_data_dir,
+            "samples_per_file": self.samples_per_file,
+            "cache_in_memory": self.cache_in_memory,
         }
         with open(self.info_file, 'w', encoding='utf-8') as f:
             json.dump(model_info, f, indent=4)
@@ -621,6 +629,13 @@ def main():
         # curriculum
         "max_subsequent_steps": 4,
         "epochs_per_stage": 20,
+        # independent random windows drawn from each trajectory file per
+        # epoch, and whether to cache each file in host RAM after its first
+        # load instead of re-reading it from disk every epoch - see
+        # SWEMultiStepDataset/SWEDataset in dataset.py. Only cheap to raise
+        # samples_per_file above 1 when cache_in_memory is also True.
+        "samples_per_file": 1,
+        "cache_in_memory": True,
         # optimization
         "batch_size": 16,
         "lr": 1e-5,
@@ -646,6 +661,8 @@ def main():
     raw_train_cfg["index"] = int(raw_train_cfg["index"])
     raw_train_cfg["max_subsequent_steps"] = int(raw_train_cfg["max_subsequent_steps"])
     raw_train_cfg["epochs_per_stage"] = int(raw_train_cfg["epochs_per_stage"])
+    raw_train_cfg["samples_per_file"] = int(raw_train_cfg["samples_per_file"])
+    raw_train_cfg["cache_in_memory"] = bool(raw_train_cfg["cache_in_memory"])
     raw_train_cfg["batch_size"] = int(raw_train_cfg["batch_size"])
     raw_train_cfg["lr"] = float(raw_train_cfg["lr"])
     raw_train_cfg["weight_decay"] = float(raw_train_cfg["weight_decay"])
@@ -676,6 +693,8 @@ def main():
         residual_prediction=train_config.residual_prediction,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,
+        samples_per_file=train_config.samples_per_file,
+        cache_in_memory=train_config.cache_in_memory,
     )
 
     trainer.train(
