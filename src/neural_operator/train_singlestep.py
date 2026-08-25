@@ -53,6 +53,7 @@ class SFNOSingleStepTrainer:
         loss_type='spectral',
         samples_per_file=1,
         cache_in_memory=True,
+        target_mode='residual',
     ):
         print("😗 😗 Starting SFNO Single Step Training 😗 😗 ".center(100))
 
@@ -71,6 +72,27 @@ class SFNOSingleStepTrainer:
         self.normalization_layer = normalization_layer
         self.loss_type = loss_type
         self.training_data_dir = training_data_dir
+        # SWEDataset's own target framing ('residual': target=u_next-u_curr;
+        # 'absolute': target=u_next). This is an architecture knob, not a
+        # data-sampling one (unlike samples_per_file/cache_in_memory below) -
+        # it's coupled to residual_prediction and included in
+        # _architecture_signature(): see the guard right below and
+        # debug_train_8_26/stage0.md Findings for why the pairing matters.
+        # residual_prediction=True already adds u_curr back onto the decoder
+        # output inside the model (torch_harmonics's SFNO.forward()), so
+        # target_mode='absolute' is what makes that addition land on the
+        # actual next state; pairing it with target_mode='residual' instead
+        # would push the decoder toward learning u_next-2*u_curr (the
+        # originally-diagnosed scale-mismatch bug).
+        self.target_mode = target_mode
+        if self.residual_prediction and self.target_mode == 'residual':
+            raise ValueError(
+                "residual_prediction=True with target_mode='residual' double-applies "
+                "u_curr (once inside the model's whole-network skip, once already "
+                "subtracted out of the target) - see debug_train_8_26/stage0.md "
+                "Findings. Use target_mode='absolute' with residual_prediction=True, "
+                "or target_mode='residual' with residual_prediction=False."
+            )
         # Data-sampling knobs (not architecture - excluded from
         # _architecture_signature() below, only recorded in model_info.json).
         self.samples_per_file = samples_per_file
@@ -83,6 +105,7 @@ class SFNOSingleStepTrainer:
 
         # Initialize the dataset
         self.ds = SWEDataset(simulation_data_dir=training_data_dir, n_future=n_future,
+                             mode=target_mode,
                              samples_per_file=samples_per_file, cache_in_memory=cache_in_memory)
         validation_split = 0.15
         self.train_dataset, self.test_dataset = torch.utils.data.random_split(
@@ -143,7 +166,7 @@ class SFNOSingleStepTrainer:
             "n_future": self.n_future, "num_layers": self.num_layers,
             "pos_embed": self.pos_embed, "scale_factor": self.scale_factor,
             "embed_dim": self.embed_dim, "residual_prediction": self.residual_prediction,
-            "inner_skip": self.inner_skip,
+            "inner_skip": self.inner_skip, "target_mode": self.target_mode,
             "normalization_layer": self.normalization_layer, "loss_type": self.loss_type,
             "training_data": self.training_data_dir,
         }
@@ -325,6 +348,7 @@ class SFNOSingleStepTrainer:
                 f"embed_dim = {self.embed_dim} : up-projection from 3 channels",
                 f"residual_prediction = {self.residual_prediction} : whole-network output += raw input",
                 f"inner_skip = {self.inner_skip} : per-block skip inside each SFNO block (none | linear | identity)",
+                f"target_mode = {self.target_mode} : SWEDataset target framing (residual: u_next-u_curr | absolute: u_next)",
                 f"normalization_layer = {self.normalization_layer} : none | layer_norm | instance_norm",
                 f"loss_type = {self.loss_type} : grid | spectral",
                 f"dataset_name = {self.dataset_name} | pressure = {self.pressure}",
@@ -361,6 +385,7 @@ class SFNOSingleStepTrainer:
             "embed_dim" : self.embed_dim , # up-projection from 3 channels"
             "residual_prediction" : self.residual_prediction ,
             "inner_skip" : self.inner_skip ,
+            "target_mode" : self.target_mode ,
             "normalization_layer" : self.normalization_layer ,
             "loss_type" : self.loss_type ,
             "run_index" : self.run_index ,
@@ -685,12 +710,22 @@ def main():
         "num_layers" : 4,
         "scale_factor" : 3,
         "embed_dim" : 16,
-        # False: SWEDataset(mode='residual', the default used here) targets are
-        # already (u_next - u_curr) deltas; the whole-network residual_prediction
-        # skip would instead push the model's raw output toward u_curr (an O(1)
-        # state), a scale mismatch with the small delta target it's trained
-        # against. See debug_train_8_26/stage0.md Findings.
-        "residual_prediction" : False,
+        # True: whole-network skip (torch_harmonics's SFNO.forward() adds the
+        # raw input u_curr back onto the decoder output) - paired below with
+        # target_mode="absolute" so that addition lands on the real next
+        # state. residual_prediction=True + target_mode="residual" is a
+        # scale-mismatch bug (the raw decoder output would be pushed toward
+        # u_next-2*u_curr instead of u_next-u_curr) and is rejected in
+        # __init__ - see debug_train_8_26/stage0.md Findings.
+        "residual_prediction" : True,
+        # "residual": SWEDataset target = u_next-u_curr (a delta, compared
+        # directly against the model's raw output - requires
+        # residual_prediction=False). "absolute": target = u_next (compared
+        # against decoder_raw + u_curr - requires residual_prediction=True).
+        # Gradient-equivalent when correctly paired: for a fixed u_curr,
+        # minimizing ||raw+u_curr-u_next||^2 (absolute) has the same gradient
+        # on raw as minimizing ||raw-(u_next-u_curr)||^2 (residual).
+        "target_mode" : "absolute",
         # "linear" | "identity" | "none" - per-block skip inside each SFNO
         # block, missing from torch_harmonics' public constructor (see
         # src/neural_operator/sfno_model.py and stage0.md Findings).
@@ -748,6 +783,7 @@ def main():
         embed_dim=train_config.embed_dim,
         residual_prediction=train_config.residual_prediction,
         inner_skip=train_config.inner_skip,
+        target_mode=train_config.target_mode,
         pos_embed=train_config.pos_embed,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,
