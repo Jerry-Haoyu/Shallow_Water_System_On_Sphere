@@ -163,6 +163,56 @@ We are on cluster. There are two skills that request a cpu and a gpu node and pr
 - Checkpoint (once training finishes): `checkpoints/neural_operator/resol_128|256/nfuture_48/nlayer_4/embed_128/trainData_(1980_2025_odd_month_500)/posEmbed_none/grid_eq/norm_layer/loss_grid/1/` (run index `1` - a fresh index because the new `inner_skip`/`residual_prediction` keys changed the architecture signature from index `0`'s old runs).
 - **Status: training in progress** (sbatch job `930185`, `l40s` partition, submitted 2026-08-24; 3000 epochs, ~15s/epoch once warmed up). Inference not yet run.
 
+### Dataset I/O speedup + oversampling (subtask 1, added mid-run)
+Job `930185`'s ~14s/epoch was diagnosed as I/O-bound rather than compute-bound:
+`SWEDataset.__getitem__` (`dataset.py`) re-reads a file's *entire* trajectory
+from disk on every call (`torch.load(..., map_location=self.device)`, fused
+with the CPU->GPU transfer), even though only 2 of its frames are used per
+sample - repeated every epoch, for all 276 files (~189MB each, ~52GB total),
+for all 3000 epochs.
+
+- `SWEDataset` gained two new (keyword-only-by-convention) constructor args:
+  - `cache_in_memory` (default `True`): loads each file once (`map_location="cpu"`,
+    into a `dict` keyed by path), reusing it on every later epoch instead of
+    re-reading from disk. Only the 2-frame window actually needed then crosses
+    PCIe to GPU per sample, not the whole file. Safe because `random_split`
+    fixes train/val file membership once at dataset construction and files are
+    never modified during training.
+  - `samples_per_file` (default `1`, matching the old one-window-per-file-per-epoch
+    behavior): draws this many independent random windows from each file per
+    epoch (`__len__` returns `len(file_list) * samples_per_file`). Only cheap
+    given `cache_in_memory=True` - without it this would multiply the
+    already-expensive full-file disk read by the same factor every epoch.
+  - Both threaded through `train_singlestep.py` (constructor args, `train_single:`
+    config keys, `model_info.json`) but deliberately **excluded** from
+    `_architecture_signature()` - they're data-sampling hyperparameters, not
+    architecture, so they don't gate resume-matching.
+- `config.yml`'s `train_single:` now sets `samples_per_file: 10`,
+  `cache_in_memory: true` for subtask 1.
+- `slurm_scripts/dbg_8_26_stage0_subtask1_train.slurm`: `--mem` raised
+  `64G -> 112G` to hold the ~52GB cache in host RAM alongside the process/CUDA
+  overhead (`l40s` nodes have up to 253GB available).
+- **Incidental bug found while smoke-testing this change** (on subtask 2's
+  data, unrelated to caching/oversampling per se): `inference_era5_direct.py`
+  was writing its subsampled reference `.pt` file directly into
+  `training_data_dir` (the same directory `SWEDataset` globs `*.pt` from for
+  training). A derived reference file with far fewer frames than a real
+  trajectory chunk gets picked up as a bogus training file, crashing
+  `__getitem__` (`step_window` computed from file 0 doesn't fit it). Fixed by
+  writing it under the rollout's own output directory (`data_dir`, derived from
+  `run()`'s return path) instead; moved the one stray file this had already
+  produced out of the training directory (to
+  `debug_train_8_26/scratch/stray_subsampled_ref_moved_from_training_dir.pt`,
+  not deleted).
+- **Status: implemented, not yet applied to the running job.** As of this
+  writing job `930185` is at epoch ~2350/3000 (~2.5h from its originally
+  configured finish); `continue: True` means a fresh submission of the same
+  architecture would resume from its last checkpoint rather than restart from
+  scratch, but with `__len__` newly multiplied by `samples_per_file`, "epoch"
+  boundaries (and the fast-forwarded LR schedule) mean something different
+  after the resume point - decision on when/whether to restart with this
+  enabled is pending.
+
 ### Subtask 2 - train directly on ERA5 (no PS solver)
 No code path for this existed before this stage (training data was previously
 always PS-solver output, per `README.md`); built from scratch:

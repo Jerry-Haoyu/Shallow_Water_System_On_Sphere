@@ -108,6 +108,13 @@ train_single:
   pos_embed: "none"  # positional embedding before SFNO layers
   normalization_layer: "layer_norm"  # none | layer_norm | instance_norm (applied inside each SFNO block)
   loss_type: "grid"  # grid | spectral (see src/neural_operator/loss.py's LOSS_FUNCTIONS)
+  # dbg_8_26_stage_0 I/O speedup (see stage0.md Findings): cache each ~189MB
+  # trajectory file in host RAM after its first load instead of re-reading it
+  # from disk every epoch (~52GB total for this directory's 276 files - the
+  # slurm script's --mem must cover this), and draw samples_per_file
+  # independent random windows from each cached file per epoch instead of 1.
+  samples_per_file: 10
+  cache_in_memory: true
   epochs: 3000
   weight_decay: 0.05
   validation_cadence: 100

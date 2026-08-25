@@ -51,6 +51,8 @@ class SFNOSingleStepTrainer:
         pos_embed='learnable lat',
         normalization_layer='none',
         loss_type='spectral',
+        samples_per_file=1,
+        cache_in_memory=True,
     ):
         print("😗 😗 Starting SFNO Single Step Training 😗 😗 ".center(100))
 
@@ -69,6 +71,10 @@ class SFNOSingleStepTrainer:
         self.normalization_layer = normalization_layer
         self.loss_type = loss_type
         self.training_data_dir = training_data_dir
+        # Data-sampling knobs (not architecture - excluded from
+        # _architecture_signature() below, only recorded in model_info.json).
+        self.samples_per_file = samples_per_file
+        self.cache_in_memory = cache_in_memory
 
         # check if gpu is available here, if not, stop the training immediately
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -76,7 +82,8 @@ class SFNOSingleStepTrainer:
             raise RuntimeError("Device is now CPU !")
 
         # Initialize the dataset
-        self.ds = SWEDataset(simulation_data_dir=training_data_dir, n_future=n_future)
+        self.ds = SWEDataset(simulation_data_dir=training_data_dir, n_future=n_future,
+                             samples_per_file=samples_per_file, cache_in_memory=cache_in_memory)
         validation_split = 0.15
         self.train_dataset, self.test_dataset = torch.utils.data.random_split(
             self.ds, [1 - validation_split, validation_split]
@@ -322,6 +329,8 @@ class SFNOSingleStepTrainer:
                 f"loss_type = {self.loss_type} : grid | spectral",
                 f"dataset_name = {self.dataset_name} | pressure = {self.pressure}",
                 f"h_avg = {self.h_avg} | h_amp = {self.h_amp} | U = {self.U:.2f} | T = {self.T:.2f}",
+                f"samples_per_file = {self.samples_per_file} : independent random windows drawn per file per epoch",
+                f"cache_in_memory = {self.cache_in_memory} : cache trajectory files in host RAM after first load",
                 f"epochs = {epochs} ({'RESUMING from ' + str(self.resume_from_epoch) if self.resume else 'fresh run'})",
                 f"lr = {lr}",
                 f"batch_size = {batch_size}" ,
@@ -363,6 +372,8 @@ class SFNOSingleStepTrainer:
             "U" : self.U ,
             "T" : self.T ,
             "save_interval_minutes" : self.save_interval_minutes ,
+            "samples_per_file" : self.samples_per_file ,
+            "cache_in_memory" : self.cache_in_memory ,
             "epochs" : epochs,
             "lr" : lr ,
             "batch_size" : batch_size ,
@@ -687,6 +698,16 @@ def main():
         "pos_embed" : 'learnable lat',
         "normalization_layer" : "none",   # none | layer_norm | instance_norm
         "loss_type" : "spectral",         # grid | spectral (see loss.py's LOSS_FUNCTIONS)
+        # independent random (u_curr, u_next) windows drawn from each
+        # trajectory file per epoch. Only cheap when cache_in_memory is also
+        # True - otherwise it multiplies the full-file disk read by this
+        # factor every epoch (see dataset.py's SWEDataset).
+        "samples_per_file" : 1,
+        # cache each trajectory file in host RAM after its first load instead
+        # of re-reading it from disk every epoch (see dataset.py). Requires
+        # the training data directory to fit in the job's host memory
+        # allocation - see debug_train_8_26/stage0.md Findings for sizing.
+        "cache_in_memory" : True,
         "batch_size" : 128,
         "lr" : 5e-4,
         "epochs" : 100,
@@ -709,6 +730,8 @@ def main():
     raw_train_cfg["warmup_start_factor"] = float(raw_train_cfg["warmup_start_factor"])
     raw_train_cfg["epochs"] = int(raw_train_cfg["epochs"])
     raw_train_cfg["batch_size"] = int(raw_train_cfg["batch_size"])
+    raw_train_cfg["samples_per_file"] = int(raw_train_cfg["samples_per_file"])
+    raw_train_cfg["cache_in_memory"] = bool(raw_train_cfg["cache_in_memory"])
 
     # "continue" is a Python keyword - can't be a SimpleNamespace attribute
     # accessed via dot syntax, so pull it out before the conversion below.
@@ -728,8 +751,10 @@ def main():
         pos_embed=train_config.pos_embed,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,
+        samples_per_file=train_config.samples_per_file,
+        cache_in_memory=train_config.cache_in_memory,
     )
-    
+
     trainer.train(
         batch_size=train_config.batch_size,
         lr=train_config.lr,

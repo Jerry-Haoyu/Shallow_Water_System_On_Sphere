@@ -108,15 +108,6 @@ def main():
         ],
     })
 
-    # subsample the real trajectory to the model's own cadence so
-    # plot_per_step_loss compares matching timestamps (frame i <-> real hour i*n_future)
-    ref_subsampled = ref_trajectory[0: n_steps * n_future + 1: n_future]
-    ref_sub_path = ref_dir / f"{cfg.ref_chunk_stem}_subsampled_every{n_future}h.pt"
-    torch.save({
-        "metadata": {**ref_data["metadata"], "save_interval_minutes": step_minutes},
-        "trajectory": ref_subsampled,
-    }, ref_sub_path)
-
     initial_condition = physical_to_nondim(ref_trajectory[0].clone(), T, U)
 
     neural_save_path = run(
@@ -133,6 +124,22 @@ def main():
 
     data_dir = Path(neural_save_path).parent
     data_file = Path(neural_save_path).name
+
+    # subsample the real trajectory to the model's own cadence so
+    # plot_per_step_loss compares matching timestamps (frame i <-> real hour
+    # i*n_future). Written under data_dir (the rollout's own output tree,
+    # rooted at model_output/.../checkpoints-mirror/ - see
+    # _data_path_from_checkpoint in run_model.py), NOT ref_dir: ref_dir is
+    # SWEDataset's training data directory (dataset.py globs every *.pt file
+    # there), so writing a derived file into it would get picked up as a bogus
+    # "trajectory" on the next training run and crash (too few frames for the
+    # configured n_future/warmup window).
+    ref_subsampled = ref_trajectory[0: n_steps * n_future + 1: n_future]
+    ref_sub_path = data_dir / f"{cfg.ref_chunk_stem}_subsampled_every{n_future}h.pt"
+    torch.save({
+        "metadata": {**ref_data["metadata"], "save_interval_minutes": step_minutes},
+        "trajectory": ref_subsampled,
+    }, ref_sub_path)
 
     plot_per_step_loss(
         neural_traj_path=Path(neural_save_path),

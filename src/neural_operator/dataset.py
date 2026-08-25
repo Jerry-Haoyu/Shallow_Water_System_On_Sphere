@@ -30,18 +30,38 @@ class SWEDataset(torch.utils.data.Dataset):
     All files are assumed to share the same solver configuration
     """
 
-    def __init__(self, simulation_data_dir, n_future, mode='residual', seed=None):
+    def __init__(self, simulation_data_dir, n_future, mode='residual', seed=None,
+                 samples_per_file=1, cache_in_memory=True):
         self.simulation_data_dir = simulation_data_dir
         self.nfuture = n_future
         self.mode= mode
         if seed is not None:
             print(f"Seeding random to {seed}")
         self._rng = random.Random(seed)
-        
+
         # Pick starting opint randomly
         self.random_flag = True
         # Store trajectories type: either 'spec' or 'physical'
         self.input_type = "spec"
+
+        # How many independent random windows to draw from each trajectory file
+        # per epoch (default 1, matching the historical one-window-per-file
+        # behavior). Raising this multiplies __len__ without touching the file
+        # list itself - see cache_in_memory below, which is what makes this
+        # cheap: without it, samples_per_file > 1 would multiply the full-file
+        # disk read (see __getitem__) by the same factor every epoch.
+        self.samples_per_file = samples_per_file
+
+        # Cache each file's full trajectory in host RAM after its first load,
+        # keyed by path, instead of re-reading it from disk on every
+        # __getitem__ call (every epoch). Safe because train/val file
+        # membership is fixed once at dataset construction (random_split
+        # operates on indices, not on file contents) and files are never
+        # modified during training. Sized against the *whole* directory
+        # (~52GB for subtask 1's 276 files as of debug_train_8_26/stage0.md) -
+        # the caller's job must request enough host memory to hold it.
+        self.cache_in_memory = cache_in_memory
+        self._cache = {} if cache_in_memory else None
 
         # every trajectory file in the directory forms the sample pool
         self.file_list = sorted(glob.glob(os.path.join(simulation_data_dir, "*.pt")))
@@ -61,6 +81,10 @@ class SWEDataset(torch.utils.data.Dataset):
         self.solver = ShallowWaterSolver(lmax=metadata["lmax"], grid=metadata["grid"], dealias=False, non_dimensional=False)
         self.solver.to(self.solver.device)
         self.device = self.solver.device
+        if self.cache_in_memory:
+            # already loaded above (on CPU) for metadata - reuse it instead of
+            # discarding and re-reading it in __getitem__.
+            self._cache[self.file_list[0]] = first["trajectory"]
 
         # minutes between consecutive saved frames in these trajectory files -
         # 30 for PS-solver output (the historical/default convention); ERA5-direct
@@ -98,7 +122,9 @@ class SWEDataset(torch.utils.data.Dataset):
             )
 
     def __len__(self):
-        return len(self.file_list)
+        # samples_per_file independent random windows are drawn from each
+        # file per epoch (default 1) - see __init__ and __getitem__.
+        return len(self.file_list) * self.samples_per_file
 
     def _spec_to_grid(self, uspec_single):
         """Convert spectral coefficients to grid space based on input_type."""
@@ -107,20 +133,37 @@ class SWEDataset(torch.utils.data.Dataset):
         else:
             return self.solver.spec2grid(uspec_single)
 
-    def __getitem__(self, index):
-        """ 
-            Each sample is a (phivortdivphi_t, (phivortdiv_{t+1}-uvphi_t)), i.e., the input is the 
-            state in grid space at timestep t and the output is the difference of the same variables between step t and t+1
-        """
-        file = self.file_list[index]
+    def _load_trajectory(self, file_idx):
+        """Return the (file_idx's) file's full spectral trajectory, on
+        self.device if uncached or on CPU if cached (see cache_in_memory).
+        Falls back to the next file in the list if loading fails."""
+        file = self.file_list[file_idx]
+        map_location = "cpu" if self.cache_in_memory else self.device
+        cache = self._cache if self.cache_in_memory else None
+
+        if cache is not None and file in cache:
+            return cache[file]
         try:
-            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+            uspec = torch.load(file, map_location=map_location, weights_only=False)["trajectory"]
         except Exception as e:
             print(f"Warning: failed to load {file}: {e}. Falling back to next file.")
             # fall back to the next valid file in the list
-            fallback_index = (index + 1) % len(self.file_list)
-            file = self.file_list[fallback_index]
-            uspec = torch.load(file, map_location=self.device, weights_only=False)["trajectory"]
+            fallback_idx = (file_idx + 1) % len(self.file_list)
+            return self._load_trajectory(fallback_idx)
+        if cache is not None:
+            cache[file] = uspec
+        return uspec
+
+    def __getitem__(self, index):
+        """
+            Each sample is a (phivortdivphi_t, (phivortdiv_{t+1}-uvphi_t)), i.e., the input is the
+            state in grid space at timestep t and the output is the difference of the same variables between step t and t+1
+        """
+        # samples_per_file windows share the same file, cycling through
+        # file_list; index // len(file_list) only picks which of the
+        # samples_per_file draws this is (the actual window is still random).
+        file_idx = index % len(self.file_list)
+        uspec = self._load_trajectory(file_idx)
 
         # pick a random starting step within the whole-trajectory window
         step_start = self._rng.randint(self.step_window[0], self.step_window[1])
@@ -130,7 +173,10 @@ class SWEDataset(torch.utils.data.Dataset):
 
         uspec_target = uspec[step_start: step_end + 1]
 
-        # first and last steps - convert based on input_type
+        # first and last steps - convert based on input_type. .to(self.device)
+        # is a no-op in the uncached path (uspec already lives there) and the
+        # real CPU->GPU transfer in the cached path - crucially only the 2
+        # selected frames cross PCIe, not the whole cached file.
         u_curr = self._spec_to_grid(uspec_target[0].to(self.device)).float()
         u_next = self._spec_to_grid(uspec_target[-1].to(self.device)).float()
 
