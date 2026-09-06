@@ -130,7 +130,12 @@ def main():
                 'nlat': solver.nlat, 'nlon': solver.nlon,
                 'lmax': solver.lmax, 'mmax': solver.mmax,
                 'grid': solver.grid,
-                'save_interval_minutes': cfg.frame_interval_minutes,
+                # ERA5-direct frames are literally on the native hourly grid -
+                # no substep quantization happens here (unlike run_model.py's
+                # numerical branch), so the achieved cadence exactly equals the
+                # requested one; still recorded under the same 'true_interval_minutes'
+                # key every downstream consumer (SWEDataset, run_model.run()) reads.
+                'true_interval_minutes': cfg.frame_interval_minutes,
                 'source': 'era5_direct',
                 'start_time': str(t0), 'end_time': str(t1),
             },

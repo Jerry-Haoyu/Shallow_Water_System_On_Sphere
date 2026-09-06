@@ -52,7 +52,9 @@ from src.helpers.run_model import (
     save_numerical_checkpoint,
     load_numerical_checkpoint,
     load_h_stats,
+    load_model_info,
     physical_to_nondim,
+    compute_step_per_save,
 )
 from src.helpers.print import print_in_box
 
@@ -99,14 +101,19 @@ def load_config():
     raw["embed_dim"] = int(raw["embed_dim"])
     raw["index"] = int(raw["index"])
     raw["duration"] = float(raw["duration"])
-    raw["spinup_days"] = int(raw['spinup_days'])
+    # float, not int: fractional spin-ups (e.g. 0.5 days) are a normal input -
+    # see different_spin_up/task.md, which sweeps spinup_days over
+    # [0.5, 1.0, ..., 4.0]. spinup_frames (below) is what actually rounds this
+    # to a whole number of training frames.
+    raw["spinup_days"] = float(raw['spinup_days'])
     # not a config input - see the comment on DEFAULT_CONFIG's rollout section.
     # Popped rather than left in raw so a stray inference.save_interval_minutes
     # in a config file is silently overridden here, not silently kept.
+    # save_interval_minutes itself is set in main(), once the trained model's
+    # own recorded true_interval_minutes is known - see the comment there.
     raw.pop("save_interval_minutes", None)
 
     cfg = SimpleNamespace(**raw)
-    cfg.save_interval_minutes = cfg.n_future * 30.0
 
     if cfg.ic == "real_world":
         if not cfg.ic_time:
@@ -140,9 +147,18 @@ def numerical_model_info_from_neural_opeartor_model_info(neural_model_dir):
     }
     return numerical_model_info 
 
-def main():
-    cfg = load_config()
+def run_rollout_pair(cfg):
+    """Resolve the trained model, build the spun-up initial condition, and run
+    both the SFNO rollout and the reference numerical rollout from it.
 
+    Factored out of main() so a batch driver (see different_spin_up/scripts)
+    can generate many (ic_time, spinup_days, duration) combinations without
+    going through config.yml/CLI for each one - main() below is just this
+    function plus the diagnostic plots, driven by a single config.yml.
+
+    Returns a SimpleNamespace with: model_dir, info_path, neural_save_path,
+    ref_save_path, neural_data, ref_data, true_interval_minutes.
+    """
     model_kwargs = dict(
         resol=(cfg.nlat, cfg.nlon),
         n_future=cfg.n_future,
@@ -156,18 +172,6 @@ def main():
         index=cfg.index,
     )
 
-    print_in_box({
-        "title": "Neural Operator Inference",
-        "lines": [
-            f"resol = ({cfg.nlat}, {cfg.nlon}) | nfuture = {cfg.n_future} | grid = {cfg.grid}",
-            f"nlayer = {cfg.num_layers} | embed = {cfg.embed_dim} | posEmbed = {cfg.pos_embed}",
-            f"trainData = {cfg.trainData} | index = {cfg.index} | single_step = {cfg.single_step}",
-            f"normalization_layer = {cfg.normalization_layer} | loss_type = {cfg.loss_type}",
-            f"duration = {cfg.duration} days | save_interval = {cfg.save_interval_minutes} min | ic = {cfg.ic}",
-        ],
-    })
-
-
     dataset_name = cfg.dataset_name if cfg.ic == "real_world" else None
 
     # dataset-wide h_avg/h_amp (real-world only) feed the IC/reference solvers'
@@ -177,7 +181,7 @@ def main():
     if cfg.ic == "real_world":
         h_avg, h_amp = load_h_stats(cfg.dataset_name)
         print(f"    Using dataset-wide h_avg={h_avg:.2f} m, h_amp={h_amp:.2f} m from '{cfg.dataset_name}'")
-        
+
     # Resolve the trained model directory; it must already exist.
     model_dir, single_name, multi_name, info_name = neural_model_path(**model_kwargs)
     ckpt_name = single_name if cfg.single_step else multi_name
@@ -190,7 +194,32 @@ def main():
             f"Train it first with `make train_single`."
         )
     print(f"📦 Using trained model {ckpt_path}")
-    
+
+    # model_info's own recorded true_interval_minutes (the REAL elapsed time
+    # per training frame, already float-rounded once at data-generation time -
+    # see run_model.py's run()) is the golden-standard source for how much
+    # real time this model's own n_future forecast-jump spans - no more
+    # assuming a nominal 30-min cadence and re-deriving the true value from it
+    # (see stage0.md Findings: frame-cadence rounding drift). This single
+    # value now drives everything below: number_of_frames for both branches,
+    # the reference solver's own substep count, the spin-up length, and all
+    # hour labels.
+    model_info = load_model_info(str(model_dir))
+    cfg.save_interval_minutes = model_info["n_future"] * model_info["true_interval_minutes"]
+
+    print_in_box({
+        "title": "Neural Operator Inference",
+        "lines": [
+            f"resol = ({cfg.nlat}, {cfg.nlon}) | nfuture = {cfg.n_future} | grid = {cfg.grid}",
+            f"nlayer = {cfg.num_layers} | embed = {cfg.embed_dim} | posEmbed = {cfg.pos_embed}",
+            f"trainData = {cfg.trainData} | index = {cfg.index} | single_step = {cfg.single_step}",
+            f"normalization_layer = {cfg.normalization_layer} | loss_type = {cfg.loss_type}",
+            f"duration = {cfg.duration} days | ic = {cfg.ic}",
+            f"save_interval (golden, = n_future * true_interval_minutes) = "
+            f"{cfg.save_interval_minutes:.2f} min ({cfg.save_interval_minutes/60:.2f} h)",
+        ],
+    })
+
     ref_num_model_info = numerical_model_info_from_neural_opeartor_model_info(neural_model_dir=model_dir)
     ref_tau, ref_semi_implicit, ref_rad = ref_num_model_info['tau'], ref_num_model_info['semi_implicit'], ref_num_model_info['rad']
 
@@ -218,7 +247,6 @@ def main():
             pressure=cfg.pressure if cfg.ic == "real_world" else None,
         )
 
-
     if cfg.ic == "galewsky":
         print("Initial conidtion is galewsky")
         phivrtdivspec_0 = galewsky_initial_condition(model=ref_solver)
@@ -239,10 +267,24 @@ def main():
             model=ref_solver, vSHT=vSHT, era5_dataset=era5_dataset, ic_time=cfg.ic_time
             )
         print("Preparing solver for grid->spec transformation and initial spin-up...")
-        # spin up the initial condition using numerical solver
+        # spin up the initial condition using the numerical solver. Substep
+        # count is derived the same way SWEDataset's own warmup_steps is (a
+        # frame count at the training data's own true_interval_minutes, times
+        # compute_step_per_save's substeps-per-frame) rather than independently
+        # from wall-clock seconds or an assumed nominal cadence, so the state
+        # handed to the model below lands on the exact same real time "frame
+        # 96" of a training trajectory represents - see stage0.md Findings
+        # (frame-cadence rounding drift) for why an independent seconds-based
+        # derivation silently drifted from that by several hours. Reading
+        # model_info["true_interval_minutes"] directly (rather than assuming
+        # 30 min) is what makes this exact even if the model was trained on
+        # data with a different native cadence (e.g. ERA5-direct).
+        train_frame_minutes = model_info["true_interval_minutes"]
+        spinup_frames = max(1, round(cfg.spinup_days * 24 * 60 / train_frame_minutes))
+        n_spinup_substeps = spinup_frames * compute_step_per_save(train_frame_minutes, ref_solver.dt, ref_solver.T)
         state = phivrtdivspec_0
         with torch.no_grad():
-            for i in tqdm.trange(int(86400*cfg.spinup_days//(ref_solver.dt * ref_solver.T)), desc=f"🐺->...->🦮  Spinning up the initial condition for {cfg.spinup_days} day"):
+            for i in tqdm.trange(n_spinup_substeps, desc=f"🐺->...->🦮  Spinning up the initial condition for {cfg.spinup_days} day"):
                 state = ref_solver.timestep(uspec=state, nsteps=1)
         phivrtdivspec_0_spinned_up = state
     else:
@@ -278,8 +320,47 @@ def main():
         pressure=cfg.pressure,
         ic_time=ic_time,
         dataset_name=dataset_name,
+        # cfg.save_interval_minutes IS the golden true_interval_minutes-derived
+        # cadence (see its computation above) - passing it here directly is
+        # what keeps both branches frame-aligned AND makes the reference
+        # trajectory advance by the real elapsed time an n_future model
+        # forecast-jump represents; no separate nominal/true split needed.
         save_interval_minutes=cfg.save_interval_minutes,
     )
+
+    # loaded once, up front: both branches' OWN recorded true_interval_minutes
+    # (see run_model.py's run()) is the ground truth for what actually
+    # happened during generation, more authoritative than re-deriving it from
+    # cfg.save_interval_minutes (the request, not the achievement) - used
+    # below for both the loss plot's x-axis and the comparison hour labels.
+    neural_data = torch.load(neural_save_path, weights_only=False)
+    ref_data = torch.load(ref_save_path, weights_only=False)
+    true_interval_minutes = ref_data["metadata"]["true_interval_minutes"]
+    print(f"    achieved true_interval_minutes: reference = {true_interval_minutes:.2f} min | "
+          f"neural = {neural_data['metadata']['true_interval_minutes']:.2f} min")
+
+    return SimpleNamespace(
+        model_dir=model_dir,
+        info_path=info_path,
+        neural_save_path=neural_save_path,
+        ref_save_path=ref_save_path,
+        neural_data=neural_data,
+        ref_data=ref_data,
+        true_interval_minutes=true_interval_minutes,
+    )
+
+
+def main():
+    cfg = load_config()
+    result = run_rollout_pair(cfg)
+
+    model_dir = result.model_dir
+    info_path = result.info_path
+    neural_save_path = result.neural_save_path
+    ref_save_path = result.ref_save_path
+    neural_data = result.neural_data
+    ref_data = result.ref_data
+    true_interval_minutes = result.true_interval_minutes
 
     data_dir = Path(neural_save_path).parent
     data_file = Path(neural_save_path).name
@@ -294,7 +375,7 @@ def main():
         info_path=info_path,
         lmax=cfg.nlat // 2,
         grid=cfg.grid,
-        save_interval_minutes=cfg.save_interval_minutes,
+        save_interval_minutes=true_interval_minutes,
         output_path=data_dir / f"{Path(data_file).stem}_l2_spectral_loss.png",
     )
 
@@ -307,11 +388,9 @@ def main():
     #     differs (plot_box_comparison is plot_sphere_comparison's flat
     #     lon/lat counterpart, see visualization.py).
     # ------------------------------------------------------------------ #
-    neural_data = torch.load(neural_save_path, weights_only=False)
-    ref_data = torch.load(ref_save_path, weights_only=False)
-
-    comparison_hours = [0, int(1 * cfg.save_interval_minutes // 60),
-                        int(2 * cfg.save_interval_minutes // 60), int(4 * cfg.save_interval_minutes // 60)]
+    comparison_hours = [0, int(1 * true_interval_minutes // 60),
+                        int(2 * true_interval_minutes // 60), int(4 * true_interval_minutes // 60),
+                        int(5 * true_interval_minutes // 60)]
 
     plot_sphere_comparison(
         ref_data=ref_data,
@@ -368,7 +447,9 @@ def plot_per_step_loss(neural_traj_path, ref_traj_path, info_path, lmax, grid,
     hours = [t * save_interval_minutes / 60.0 for t in range(n_steps)]
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.semilogy(hours, losses, marker=".", markersize=3, linewidth=1)
+    ax.plot(hours, losses, marker=".", markersize=3, linewidth=1)
+    ax.set_ylim(0, 1.0)
+    print(f"\n The per-step losses are: {[f"{loss:.2f}" for loss in losses]} \n ")
     ax.set_xlabel("time (hours)")
     ax.set_ylabel("relative spectral L2 loss")
     ax.set_title("SFNO rollout vs. numerical reference")

@@ -1,6 +1,6 @@
 import torch
 
-def l2loss_sphere(solver, prd, tar, relative=False, squared=True):
+def l2loss_sphere(solver, prd, tar, relative=True, squared=False):
     # integrate_grid reduces (nlat, nlon) only and keeps the channel axis
     # (..., channel) - left alone here (no .sum(dim=-1)) so geopotential/
     # vorticity/divergence, which can differ by orders of magnitude, don't
@@ -20,7 +20,24 @@ def l2loss_sphere(solver, prd, tar, relative=False, squared=True):
 
     return loss
 
-def spectral_l2loss_sphere(solver, prd, tar, relative=False, squared=True):
+def l1loss_sphere(solver, prd, tar, relative=True, squared=False):
+    # akin to l2loss_sphere above but with an L1 (mean-absolute) norm instead
+    # of an L2 (root-mean-square) one - squared/sqrt are meaningless for L1,
+    # so `squared` is accepted only for a drop-in-compatible call signature
+    # with LOSS_FUNCTIONS' other entries and is otherwise ignored.
+    loss = solver.integrate_grid(torch.abs(prd - tar), dimensionless=True)  # (..., channel)
+
+    if relative:
+        # each channel normalized by its OWN target L1 norm - same
+        # magnitude-agnostic per-channel weighting as l2loss_sphere.
+        tar_norm = solver.integrate_grid(torch.abs(tar), dimensionless=True)  # (..., channel)
+        loss = loss / tar_norm.clamp_min(1e-12)
+
+    loss = loss.mean()  # average over batch AND channel, so each channel counts equally
+
+    return loss
+
+def spectral_l2loss_sphere(solver, prd, tar, relative=True, squared=False):
     # compute coefficients, keeping the channel axis separate from the degree
     # axis (summed below) so geopotential/vorticity/divergence - which can
     # differ by orders of magnitude depending on the input normalization -
@@ -53,5 +70,6 @@ def spectral_l2loss_sphere(solver, prd, tar, relative=False, squared=True):
 # src/helpers/run_model.py's _neural_config_nodes/neural_model_path).
 LOSS_FUNCTIONS = {
     "grid": l2loss_sphere,
+    "grid_l1": l1loss_sphere,
     "spectral": spectral_l2loss_sphere,
 }

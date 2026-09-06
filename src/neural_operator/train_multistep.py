@@ -37,7 +37,15 @@ class SFNOMultiStepTrainer:
 
         Initialize teacher and student from the single-step checkpoint.
         Freeze the teacher.
-        for curr_step = 1 .. max_subsequent_steps:
+        for curr_step = min_curr_step .. max_subsequent_steps:
+            best_val_loss = inf   # reset every stage - see train()'s stage-
+                                   # transition block: a later stage rolls out
+                                   # further and is intrinsically harder (larger
+                                   # loss) than an earlier one, so a single
+                                   # running minimum across the whole curriculum
+                                   # would let an easy early stage's optimum
+                                   # permanently block every later stage's
+                                   # checkpoint from ever being saved.
             while student not converged:
                 teacher_step ~ Uniform{1, .., curr_step}
                 obs1 = t(1), obs2 = t(teacher_step - 1), target = t(teacher_step)
@@ -51,6 +59,13 @@ class SFNOMultiStepTrainer:
       - `teacher_step` is sampled once per mini-batch (not per example), so a
         whole batch shares one rollout length per step - otherwise every
         example in the batch would need its own teacher rollout length.
+      - the curriculum starts at curr_step=min_curr_step (default 2), not 1:
+        curr_step==1 forces teacher_step==1 always, which makes the
+        multi_step_loss/single_step_loss terms in _run_stage_epoch identical
+        (see its docstring) - i.e. a curr_step==1 stage is just single-step
+        training, already covered by train_singlestep.py's own pretraining
+        that this curriculum builds on top of, so spending epochs_per_stage
+        epochs repeating it here is wasted budget.
 
     The run lives in the SAME checkpoint directory as the single-step run it
     builds on (README.md: checkpoints_single.pt / checkpoints_multi.pt sit
@@ -75,8 +90,10 @@ class SFNOMultiStepTrainer:
         scale_factor=1,
         normalization_layer="none",
         loss_type="spectral",
+        with_single_loss=False,
         samples_per_file=1,
         cache_in_memory=True,
+        min_curr_step=2,
     ):
         print("🧑‍🏫 🧑‍🎓 Starting SFNO Multi-Step Curriculum Training 🧑‍🎓 🧑‍🏫".center(100))
         self.start_time = time.perf_counter()
@@ -89,7 +106,16 @@ class SFNOMultiStepTrainer:
         self.pos_embed = pos_embed
         self.grid = grid
         self.scale_factor = scale_factor
+        self.with_single_loss = with_single_loss
         self.max_subsequent_steps = max_subsequent_steps
+        # curriculum starts at curr_step=min_curr_step rather than 1 - see
+        # class docstring for why a curr_step==1 stage is wasted budget.
+        self.min_curr_step = min_curr_step
+        if self.min_curr_step > self.max_subsequent_steps:
+            raise ValueError(
+                f"min_curr_step={self.min_curr_step} exceeds max_subsequent_steps="
+                f"{self.max_subsequent_steps} - there would be no curriculum stage to run."
+            )
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if self.device.type == 'cpu':
@@ -242,7 +268,10 @@ class SFNOMultiStepTrainer:
         continue_training,
     ):
         self.epochs_per_stage = epochs_per_stage
-        self.total_epochs = self.max_subsequent_steps * self.epochs_per_stage
+        # stages run min_curr_step .. max_subsequent_steps inclusive, i.e.
+        # (max_subsequent_steps - min_curr_step + 1) stages, not
+        # max_subsequent_steps of them (that would assume stages start at 1).
+        self.total_epochs = (self.max_subsequent_steps - self.min_curr_step + 1) * self.epochs_per_stage
 
         run_log_dir = self.run_dir.replace(self.CHECKPOINT_ROOT, self.LOG_ROOT, 1)
         os.makedirs(self.run_dir, exist_ok=True)
@@ -272,11 +301,19 @@ class SFNOMultiStepTrainer:
             resume_checkpoint = torch.load(self.checkpoint, map_location=self.device, weights_only=True)
             stored_max_steps = resume_checkpoint.get("max_subsequent_steps")
             stored_eps = resume_checkpoint.get("epochs_per_stage")
-            if stored_max_steps != self.max_subsequent_steps or stored_eps != epochs_per_stage:
+            # default 1 (not this class's new default of 2) for a checkpoint
+            # saved before min_curr_step existed - it was trained under the
+            # old implicit curr_step==1-start schedule, so a mismatch against
+            # today's default is exactly the "schedule changed mid-run" case
+            # this check exists to catch.
+            stored_min_curr_step = resume_checkpoint.get("min_curr_step", 1)
+            if (stored_max_steps != self.max_subsequent_steps or stored_eps != epochs_per_stage
+                    or stored_min_curr_step != self.min_curr_step):
                 raise ValueError(
                     f"Existing {self.checkpoint} was trained with max_subsequent_steps="
-                    f"{stored_max_steps}, epochs_per_stage={stored_eps}; config asks for "
-                    f"{self.max_subsequent_steps}/{epochs_per_stage}. The curriculum schedule "
+                    f"{stored_max_steps}, epochs_per_stage={stored_eps}, min_curr_step="
+                    f"{stored_min_curr_step}; config asks for {self.max_subsequent_steps}/"
+                    f"{epochs_per_stage}/{self.min_curr_step}. The curriculum schedule "
                     f"can't change mid-run - set continue: false to start a fresh curriculum."
                 )
             self.resume = True
@@ -298,6 +335,7 @@ class SFNOMultiStepTrainer:
                 "title": "🆕  STARTING A NEW CURRICULUM (multistep)  🆕",
                 "lines": [
                     f"checkpoint -> {self.checkpoint}",
+                    f"with_single_loss={self.with_single_loss}",
                     f"max_subsequent_steps={self.max_subsequent_steps} x epochs_per_stage={epochs_per_stage} "
                     f"= {self.total_epochs} total epochs",
                 ],
@@ -307,7 +345,7 @@ class SFNOMultiStepTrainer:
             "title": "SFNO Multi-Step Curriculum Config",
             "lines": [
                 f"nlat = {self.nlat} | nlon = {self.nlon} | n_future = {self.n_future}",
-                f"max_subsequent_steps = {self.max_subsequent_steps}",
+                f"min_curr_step = {self.min_curr_step} -> max_subsequent_steps = {self.max_subsequent_steps}",
                 f"epochs_per_stage = {epochs_per_stage} -> total_epochs = {self.total_epochs}",
                 f"lr = {lr} | batch_size = {batch_size} | weight_decay = {weight_decay}",
                 f"warmup_epochs = {warmup_epochs} | restart = {restart}",
@@ -341,6 +379,8 @@ class SFNOMultiStepTrainer:
         # in model_info.json (nested under "multistep" so nothing collides).
         model_info = dict(self.source_info)
         model_info["multistep"] = {
+            "with_single_loss": self.with_single_loss,
+            "min_curr_step": self.min_curr_step,
             "max_subsequent_steps": self.max_subsequent_steps,
             "epochs_per_stage": epochs_per_stage,
             "total_epochs": self.total_epochs,
@@ -363,8 +403,10 @@ class SFNOMultiStepTrainer:
         return resume_checkpoint
 
     def _curr_step_for_epoch(self, epoch, epochs_per_stage):
-        """1-indexed curriculum stage active during `epoch` (0-indexed)."""
-        return min(epoch // epochs_per_stage + 1, self.max_subsequent_steps)
+        """Curriculum stage (teacher_step upper bound) active during `epoch`
+        (0-indexed) - ranges over min_curr_step .. max_subsequent_steps, not
+        1 .. max_subsequent_steps (see class docstring)."""
+        return min(epoch // epochs_per_stage + self.min_curr_step, self.max_subsequent_steps)
 
     def _gpu_utilization(self):
         try:
@@ -457,16 +499,7 @@ class SFNOMultiStepTrainer:
         return state
 
     def _run_stage_epoch(self, loader, curr_step, train, optimizer=None):
-        """One pass over `loader` at curriculum stage `curr_step`; returns the
-        mean of (multi_step_loss + single_step_loss) / 2 - averaging the two
-        terms (rather than summing them) purely for logging comparability
-        with train_singlestep.py's single-term loss: at curr_step == 1,
-        teacher_step is forced to 1, which makes multi_step_loss and
-        single_step_loss numerically identical (see class docstring), so an
-        unaveraged sum reads exactly 2x train_singlestep.py's own loss for an
-        architecturally-equivalent computation. Cosmetic only - loss.backward()
-        below still uses the full (unaveraged) sum, so training dynamics are
-        unchanged."""
+        """One pass over `loader` at curriculum stage `curr_step`"""
         self.student.train(train)
         total_loss, n_batches = 0.0, 0
         torch.set_grad_enabled(train)
@@ -476,27 +509,32 @@ class SFNOMultiStepTrainer:
 
             # sampled once per batch (see class docstring)
             teacher_step = random.randint(1, curr_step)
-            obs2 = window[:, teacher_step - 1]
             target = window[:, teacher_step]
 
             teacher_output = self._rollout_teacher(obs1, teacher_step - 1)
 
-            # same target_mode branching as _rollout_teacher above: the
-            # student's raw output only IS the prediction directly comparable
-            # to `target` when target_mode == 'absolute' - otherwise it's a
-            # delta relative to the student's own input and must be added
-            # back first.
             multi_step_out = self.student(teacher_output)
-            single_step_out = self.student(obs2)
-            if self.target_mode == "absolute":
-                multi_step_prd, single_step_prd = multi_step_out, single_step_out
-            else:
-                multi_step_prd = teacher_output + multi_step_out
-                single_step_prd = obs2 + single_step_out
-
-            multi_step_loss = self.loss(self.solver, multi_step_prd, target, relative=True, squared=False)
-            single_step_loss = self.loss(self.solver, single_step_prd, target, relative=True, squared=False)
-            loss = multi_step_loss + single_step_loss
+            
+            if self.with_single_loss is True:
+                obs2 = window[:, teacher_step - 1]
+                single_step_out = self.student(obs2)
+                if self.target_mode == "absolute":
+                    multi_step_prd, single_step_prd = multi_step_out, single_step_out
+                else:
+                    multi_step_prd = teacher_output + multi_step_out
+                    single_step_prd = obs2 + single_step_out
+                
+                multi_step_loss = self.loss(self.solver, multi_step_prd, target, relative=True, squared=False)
+                single_step_loss = self.loss(self.solver, single_step_prd, target, relative=True, squared=False)
+                loss = multi_step_loss + single_step_loss
+            else:    
+                if self.target_mode == "absolute":
+                    multi_step_prd = multi_step_out
+                else:
+                    multi_step_prd = teacher_output + multi_step_out
+                
+                multi_step_loss = self.loss(self.solver, multi_step_prd, target, relative=True, squared=False)
+                loss = multi_step_loss
 
             if train:
                 assert optimizer is not None, "optimizer required when train=True"
@@ -504,10 +542,11 @@ class SFNOMultiStepTrainer:
                 loss.backward()
                 optimizer.step()
 
-            # /2 here only, not on `loss` above - backward() already ran on
-            # the full sum, so gradients/training dynamics are untouched;
-            # only the logged/returned value is rescaled for comparability.
-            total_loss += loss.item() / 2
+            if self.with_single_loss:
+                total_loss += loss.item() / 2
+            else :
+                total_loss += loss.item()
+            
             n_batches += 1
         torch.set_grad_enabled(True)
         return total_loss / max(n_batches, 1)
@@ -523,14 +562,7 @@ class SFNOMultiStepTrainer:
             main = sched.CosineAnnealingWarmRestarts(
                 optimizer, T_0=t0, T_mult=restart_mult)
         else:
-            main = sched.SequentialLR(
-                optimizer, 
-                schedulers=[
-                    sched.ConstantLR(optimizer, factor=1e-1, total_iters=self.epochs_per_stage), # for stage 1 training(single-step), pervent catstrophic forgetting
-                    sched.ConstantLR(optimizer, factor=1.0, total_iters=remaining-self.epochs_per_stage)
-                ],
-                milestones=[self.epochs_per_stage]
-            )
+            main = sched.ConstantLR(optimizer, factor=1.0, total_iters=remaining)
 
         if warmup_epochs > 0:
             warmup = sched.LinearLR(
@@ -627,8 +659,16 @@ class SFNOMultiStepTrainer:
 
             # "teacher = student; freeze the weights of the teacher model" -
             # fires exactly once, at the start of a new curriculum stage.
+            # best_val_loss also resets here (back to its __init__ default of
+            # inf) - a later stage rolls out further and is intrinsically
+            # harder than an earlier one, so without this reset a single
+            # running minimum across the whole curriculum would let an easy
+            # early stage's optimum permanently block every later, harder
+            # stage's checkpoint from ever being saved (its val_loss would
+            # essentially never beat the earlier stage's).
             if curr_step != prev_curr_step:
                 self._sync_teacher_to_student()
+                self.best_val_loss = math.inf
                 prev_curr_step = curr_step
 
             epoch_start = time.perf_counter()
@@ -655,6 +695,7 @@ class SFNOMultiStepTrainer:
                         "task_name": self.task_name,
                         "max_subsequent_steps": self.max_subsequent_steps,
                         "epochs_per_stage": epochs_per_stage,
+                        "min_curr_step": self.min_curr_step,
                     }, self.checkpoint)
 
             epoch_time = time.perf_counter() - epoch_start
@@ -664,7 +705,8 @@ class SFNOMultiStepTrainer:
 
         total_time = time.perf_counter() - self.start_time
         print(f"㊣ ㊣ ㊣ Finished Multi-Step Curriculum Training ! Total time spent {total_time:3f} ㊣ ㊣ ㊣")
-        print(f"Best validation loss = {self.best_val_loss:.6e} -> {self.checkpoint}")
+        print(f"Best validation loss of the final stage (curr_step={self.max_subsequent_steps}) "
+              f"= {self.best_val_loss:.6e} -> {self.checkpoint}")
 
 
 def main():
@@ -691,9 +733,15 @@ def main():
         "grid": "equiangular",
         "normalization_layer": "none",  # must match the single-step run's own value
         "loss_type": "spectral",        # must match the single-step run's own value
+        "with_single_loss": False,      # whether to include single-step loss in the loss function
         "index": 0,
         # curriculum
         "max_subsequent_steps": 4,
+        # stages run min_curr_step .. max_subsequent_steps - default 2 (not
+        # 1) skips the degenerate curr_step==1 stage, which is just
+        # single-step training and so is wasted budget on top of
+        # train_singlestep.py's own pretraining (see class docstring).
+        "min_curr_step": 2,
         "epochs_per_stage": 20,
         # independent random windows drawn from each trajectory file per
         # epoch, and whether to cache each file in host RAM after its first
@@ -725,7 +773,9 @@ def main():
     raw_train_cfg["scale_factor"] = int(raw_train_cfg["scale_factor"])
     raw_train_cfg["embed_dim"] = int(raw_train_cfg["embed_dim"])
     raw_train_cfg["index"] = int(raw_train_cfg["index"])
+    raw_train_cfg["with_single_loss"] = bool(raw_train_cfg["with_single_loss"])
     raw_train_cfg["max_subsequent_steps"] = int(raw_train_cfg["max_subsequent_steps"])
+    raw_train_cfg["min_curr_step"] = int(raw_train_cfg["min_curr_step"])
     raw_train_cfg["epochs_per_stage"] = int(raw_train_cfg["epochs_per_stage"])
     raw_train_cfg["samples_per_file"] = int(raw_train_cfg["samples_per_file"])
     raw_train_cfg["cache_in_memory"] = bool(raw_train_cfg["cache_in_memory"])
@@ -755,9 +805,11 @@ def main():
         grid=train_config.grid,
         index=train_config.index,
         max_subsequent_steps=train_config.max_subsequent_steps,
+        min_curr_step=train_config.min_curr_step,
         scale_factor=train_config.scale_factor,
         normalization_layer=train_config.normalization_layer,
         loss_type=train_config.loss_type,
+        with_single_loss=train_config.with_single_loss,
         samples_per_file=train_config.samples_per_file,
         cache_in_memory=train_config.cache_in_memory,
     )

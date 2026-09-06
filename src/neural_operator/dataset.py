@@ -86,13 +86,14 @@ class SWEDataset(torch.utils.data.Dataset):
             # discarding and re-reading it in __getitem__.
             self._cache[self.file_list[0]] = first["trajectory"]
 
-        # minutes between consecutive saved frames in these trajectory files -
-        # 30 for PS-solver output (the historical/default convention); ERA5-direct
-        # trajectories (see src/entries/build_era5_trajectory_dataset.py) record
-        # their own real cadence (typically 60, ERA5's native hourly resolution)
-        # here instead. Recorded into model_info.json so inference-time rollout
-        # (run_model.py's run()) knows how many minutes n_future actually spans.
-        self.save_interval_minutes = metadata.get("save_interval_minutes", 30)
+        # REAL elapsed minutes between consecutive saved frames in these
+        # trajectory files - the achieved cadence run()'s numerical branch (or
+        # build_era5_trajectory_dataset.py, exactly, for ERA5-direct data)
+        # actually realized, not a nominal/requested one (see stage0.md
+        # Findings: frame-cadence rounding drift). Recorded into
+        # model_info.json so inference-time rollout (run_model.py's run())
+        # knows how many real minutes n_future actually spans.
+        self.true_interval_minutes = metadata["true_interval_minutes"]
 
         # non-dimensionalization scales (T, U), keyed by this training data's
         # own dataset-wide h_avg (README.md convention: recovered from
@@ -114,7 +115,7 @@ class SWEDataset(torch.utils.data.Dataset):
         # output, warmup=96) or 60 min apart (ERA5-direct, warmup=48).
         n_frames = first["trajectory"].shape[0]
         print(f"💿 SWE Dataset: Each trajectory has n_frames={n_frames} ")
-        warmup_steps = max(1, round(2 * 24 * 60 / self.save_interval_minutes))
+        warmup_steps = max(1, round(2 * 24 * 60 / self.true_interval_minutes))
         self.step_window = (warmup_steps, n_frames - 1 - self.nfuture)
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(
@@ -234,10 +235,10 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
             # discarding and re-reading it in __getitem__.
             self._cache[self.file_list[0]] = first["trajectory"]
 
-        # minutes between consecutive saved frames - same field SWEDataset
-        # reads, used the same way below (2-day warmup in units of this
-        # file's own frame cadence).
-        self.save_interval_minutes = metadata.get("save_interval_minutes", 30)
+        # real elapsed minutes between consecutive saved frames - same field
+        # SWEDataset reads, used the same way below (2-day warmup in units of
+        # this file's own frame cadence).
+        self.true_interval_minutes = metadata["true_interval_minutes"]
 
         self.window_frames = max_subsequent_steps * n_future + 1
         n_frames = first["trajectory"].shape[0]
@@ -247,7 +248,7 @@ class SWEMultiStepDataset(torch.utils.data.Dataset):
         # spin-up/edge effects - same reasoning and formula as SWEDataset's
         # step_window (dataset.py), previously missing here entirely (this
         # class started sampling from step 0).
-        warmup_steps = max(1, round(2 * 24 * 60 / self.save_interval_minutes))
+        warmup_steps = max(1, round(2 * 24 * 60 / self.true_interval_minutes))
         self.step_window = (warmup_steps, n_frames - self.window_frames)
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(

@@ -133,7 +133,7 @@ class SFNOSingleStepTrainer:
         self.dataset_name, self.pressure = self.ds.dataset_name, self.ds.pressure
         self.h_avg, self.h_amp = self.ds.h_avg, self.ds.h_amp
         self.T, self.U = self.ds.T, self.ds.U
-        self.save_interval_minutes = self.ds.save_interval_minutes
+        self.true_interval_minutes = self.ds.true_interval_minutes
 
         # Initalize the model
         self.model = SFNO(
@@ -184,35 +184,38 @@ class SFNOSingleStepTrainer:
         }
 
     @staticmethod
-    def _find_matching_run(base_dir, signature):
-        """Scan ``base_dir``'s 0/, 1/, ... sub-directories for one whose
-        model_info.json matches ``signature`` (exact equality on every key the
-        candidate file actually has). Returns ``(index, model_info)`` for the
-        first match, else ``(None, None)``.
+    def _load_run_at_index(base_dir, index, signature):
+        """Load ``model_info.json`` from ``base_dir/<index>/`` and verify it
+        matches ``signature`` (exact equality on every key the file actually
+        has). Raises ``FileNotFoundError``/``ValueError`` with an explicit
+        message if the slot doesn't exist or its architecture doesn't match -
+        continuing into the wrong run (or a mismatched architecture) would
+        silently load weights that don't mean what the current model expects,
+        so this must fail loudly rather than fall back to a fresh run.
 
-        A key that's present in the candidate but differs still fails the
-        match. A key that's simply *absent* (e.g. an older run trained before
-        that knob was added to model_info.json's schema) does not block a
-        match on its own - there's nothing in the file to contradict, and
-        treating "never recorded" the same as "recorded and different" would
+        A key that's present in the candidate but differs fails the match. A
+        key that's simply *absent* (e.g. an older run trained before that
+        knob was added to model_info.json's schema) does not block a match on
+        its own - there's nothing in the file to contradict, and treating
+        "never recorded" the same as "recorded and different" would
         permanently orphan every run trained before a new knob was tracked.
-        A directory whose model_info.json is missing/unreadable is skipped.
         """
-        if not os.path.isdir(base_dir):
-            return None, None
-        for name in sorted((d for d in os.listdir(base_dir) if d.isdigit()), key=int):
-            sub_dir = os.path.join(base_dir, name)
-            info_path = os.path.join(sub_dir, "model_info.json")
-            if not (os.path.isdir(sub_dir) and os.path.isfile(info_path)):
-                continue
-            try:
-                with open(info_path, "r", encoding="utf-8") as f:
-                    info = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if all(key not in info or info[key] == value for key, value in signature.items()):
-                return int(name), info
-        return None, None
+        sub_dir = os.path.join(base_dir, str(index))
+        info_path = os.path.join(sub_dir, "model_info.json")
+        if not os.path.isfile(info_path):
+            raise FileNotFoundError(
+                f"continue=True with index={index}, but {info_path} does not "
+                f"exist - there is no run to continue at that index.")
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        mismatches = {key: (info[key], value) for key, value in signature.items()
+                      if key in info and info[key] != value}
+        if mismatches:
+            raise ValueError(
+                f"continue=True with index={index}, but {info_path}'s architecture "
+                f"does not match the current config. Mismatched keys "
+                f"(recorded, current): {mismatches}")
+        return info
 
     def _load_history_from_csv(self):
         """Reconstruct in-memory history (for the dashboard) from an existing
@@ -245,6 +248,7 @@ class SFNOSingleStepTrainer:
                     restart_mult,
                     validation_cadence,
                     continue_training,
+                    continue_index,
         ):
         """Build the task name and create the per-run output files/directories.
 
@@ -277,23 +281,20 @@ class SFNOSingleStepTrainer:
             loss_type=self.loss_type,
         )
 
-        # If continue_training is set, search 0/, 1/, ... for a run with the
-        # SAME ARCHITECTURE (training hyperparameters need not match - lr,
-        # epochs, schedule, etc. are all free to change on a continuation) and
-        # resume it instead of starting over with reinitialized weights.
+        # If continue_training is set, continue_index names the exact 0/, 1/,
+        # ... slot to resume (its architecture is verified to match this run's
+        # - training hyperparameters need not match, since lr, epochs,
+        # schedule, etc. are all free to change on a continuation).
         # Otherwise (the default) always claim a fresh index, full stop.
         probe_dir, *_ = neural_model_path(index=0, **model_path_kwargs)
         base_ckpt_dir = os.path.dirname(probe_dir)
 
-        match_index, match_info = (
-            self._find_matching_run(base_ckpt_dir, self._architecture_signature())
-            if continue_training else (None, None)
-        )
-
-        if match_index is not None and match_info is not None:
+        if continue_training:
+            match_info = self._load_run_at_index(
+                base_ckpt_dir, continue_index, self._architecture_signature())
             self.resume = True
             self.resume_from_epoch = int(match_info["epochs"])
-            self.run_index = match_index
+            self.run_index = continue_index
         else:
             self.resume = False
             self.resume_from_epoch = 0
@@ -315,7 +316,7 @@ class SFNOSingleStepTrainer:
         # -------------------------------------------------------------- #
         if self.resume:
             print_in_box({
-                "title": "🔁🔁🔁  continue=True: RESUMING EXISTING RUN (architecture match found)  🔁🔁🔁",
+                "title": f"🔁🔁🔁  continue=True: RESUMING RUN {self.run_index}/ (architecture verified)  🔁🔁🔁",
                 "lines": [
                     f"That run already completed {self.resume_from_epoch} epoch(s).",
                     (f"Continuing training from epoch {self.resume_from_epoch} up to {epochs} epoch(s) total."
@@ -323,20 +324,12 @@ class SFNOSingleStepTrainer:
                      f"It already covers the requested {epochs} epoch(s) - nothing left to train."),
                 ],
             })
-        elif continue_training:
-            print_in_box({
-                "title": "🆕  continue=True but NO ARCHITECTURE MATCH found: NEW RUN  🆕",
-                "lines": [
-                    f"Searched 0/, 1/, ... under {base_ckpt_dir}; none share this architecture.",
-                    f"Using a fresh index: {self.run_index}/",
-                ],
-            })
         else:
             print_in_box({
                 "title": "🆕  continue=False: STARTING FROM SCRATCH (no search performed)  🆕",
                 "lines": [
                     f"Using a fresh index: {self.run_index}/ under {base_ckpt_dir}",
-                    f"Set 'continue: true' in config to resume a matching architecture instead.",
+                    f"Set 'continue: true' and 'index: <n>' in config to resume run n instead.",
                 ],
             })
 
@@ -353,7 +346,7 @@ class SFNOSingleStepTrainer:
             "title": "SFNO Model Basic Architecture and Training Config",
             "lines": [
                 f"nlat = {self.nlat} | nlon = {self.nlon} : Resolution",
-                f"n_future = {self.n_future} : M(D_t) = D_(t+n_future*{self.save_interval_minutes}min)",
+                f"n_future = {self.n_future} : M(D_t) = D_(t+n_future*{self.true_interval_minutes:.2f}min)",
                 f"num_layers = {self.num_layers} : number of SFNO layers",
                 f"pos_embed = {self.pos_embed} : positional embedding before SFNO layers",
                 f"scale_factor = {self.scale_factor} : downsampling ratio",
@@ -410,7 +403,7 @@ class SFNOSingleStepTrainer:
             "h_amp" : self.h_amp ,
             "U" : self.U ,
             "T" : self.T ,
-            "save_interval_minutes" : self.save_interval_minutes ,
+            "true_interval_minutes" : self.true_interval_minutes ,
             "samples_per_file" : self.samples_per_file ,
             "cache_in_memory" : self.cache_in_memory ,
             "epochs" : epochs,
@@ -590,8 +583,12 @@ class SFNOSingleStepTrainer:
         restart_period=None,        # first restart cycle length T_0 (epochs)
         restart_mult=1,             # restart cycle growth factor T_mult
         compile=True,  # Whether to compile the model
-        continue_training=False,    # resume a matching-architecture run instead of starting fresh
+        continue_training=False,    # resume the run at continue_index instead of starting fresh
+        continue_index=None,        # 0/, 1/, ... slot to resume; required when continue_training=True
         ):
+
+        if continue_training and continue_index is None:
+            raise ValueError("continue_training=True requires continue_index to be set.")
 
         self._setup_run(epochs,
                         lr,
@@ -604,6 +601,7 @@ class SFNOSingleStepTrainer:
                         restart_mult,
                         validation_cadence,
                         continue_training,
+                        continue_index,
                         )
 
         if self.resume and self.resume_from_epoch >= epochs:
@@ -775,7 +773,8 @@ def main():
         "restart_period" : 30,
         "restart_mult" : 2,
         "compile" : False,
-        "continue" : False,   # resume a matching-architecture run instead of starting fresh
+        "continue" : False,   # resume the run at "index" instead of starting fresh
+        "index" : None,       # 0/, 1/, ... slot to resume; required when continue=True
     }
 
     raw_train_cfg = DEFAULT_CONFIG | config.get("train_single", {}) # config.get syntax : get(key, fallback)
@@ -793,6 +792,13 @@ def main():
     # "continue" is a Python keyword - can't be a SimpleNamespace attribute
     # accessed via dot syntax, so pull it out before the conversion below.
     continue_training = bool(raw_train_cfg.pop("continue"))
+    continue_index = raw_train_cfg.pop("index")
+    if continue_training and continue_index is None:
+        raise ValueError(
+            "train_single.continue is True but train_single.index is not set - "
+            "index must name the 0/, 1/, ... slot to resume.")
+    if continue_index is not None:
+        continue_index = int(continue_index)
 
     # this allows yml file dict access to go from file['attribute'] to file.attribute
     train_config = SimpleNamespace(**raw_train_cfg)
@@ -827,6 +833,7 @@ def main():
         restart_mult=train_config.restart_mult,
         compile=train_config.compile,
         continue_training=continue_training,
+        continue_index=continue_index,
     )
 
 

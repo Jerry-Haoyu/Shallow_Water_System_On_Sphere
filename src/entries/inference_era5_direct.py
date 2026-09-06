@@ -83,7 +83,7 @@ def main():
 
     model_info = load_model_info(model_dir)
     T, U = model_info["T"], model_info["U"]
-    train_interval_minutes = model_info.get("save_interval_minutes", 30)
+    train_interval_minutes = model_info["true_interval_minutes"]
     n_future = model_info["n_future"]
     step_minutes = train_interval_minutes * n_future  # finest legal rollout cadence
 
@@ -137,7 +137,7 @@ def main():
     ref_subsampled = ref_trajectory[0: n_steps * n_future + 1: n_future]
     ref_sub_path = data_dir / f"{cfg.ref_chunk_stem}_subsampled_every{n_future}h.pt"
     torch.save({
-        "metadata": {**ref_data["metadata"], "save_interval_minutes": step_minutes},
+        "metadata": {**ref_data["metadata"], "true_interval_minutes": step_minutes},
         "trajectory": ref_subsampled,
     }, ref_sub_path)
 

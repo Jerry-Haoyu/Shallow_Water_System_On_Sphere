@@ -89,6 +89,35 @@ def physical_to_nondim(x, T, U):
     return out
 
 
+def compute_step_per_save(cadence_minutes, dt, T=1.0):
+    """Number of solver substeps between two saved frames, for a nominal save
+    cadence given in minutes. solver.dt is in units of T (=1 second when the
+    solver is dimensional), so cadence_minutes is converted to those units
+    before dividing. The division is rounded to the nearest integer (a
+    fractional number of substeps isn't representable), so the *actual*
+    physical time elapsed per saved frame is only approximately
+    cadence_minutes - see true_cadence_minutes() for that real value.
+
+    Single source of truth for this formula: reused by run()'s numerical
+    branch and by any caller (e.g. inference.py's spin-up) that needs to
+    reproduce the exact substep count a trajectory was generated with.
+    """
+    return max(1, round(cadence_minutes * 60.0 / (dt * T)))
+
+
+def true_cadence_minutes(cadence_minutes, dt, T=1.0):
+    """The real elapsed time (in minutes) actually realized per saved frame,
+    once compute_step_per_save's integer rounding is accounted for - e.g.
+    ~32.58 real minutes for a nominal 30-minute cadence, because
+    round(1800 / (dt*T)) doesn't divide 1800 evenly. See stage0.md Findings
+    (frame-cadence rounding drift) for why this distinction matters: code
+    that assumes a saved frame index N always corresponds to exactly
+    N * cadence_minutes of elapsed physical time will silently drift from
+    what actually happened during generation.
+    """
+    return compute_step_per_save(cadence_minutes, dt, T) * dt * T / 60.0
+
+
 # --------------------------------------------------------------------------- #
 # Naming / organization convention (README.md)
 #
@@ -352,7 +381,8 @@ def is_neural_checkpoint(model_checkpoint):
 
 
 def _data_path_from_checkpoint(model_checkpoint, duration, ic,
-                               pressure=None, ic_time=None, dataset_name=None):
+                               pressure=None, ic_time=None, dataset_name=None,
+                               single_step=True):
     """(directory, file_name) of a run's trajectory output, derived entirely
     from `model_checkpoint`'s own path plus the data-specific info a single
     checkpoint doesn't pin down (duration, ic, ...).
@@ -364,7 +394,16 @@ def _data_path_from_checkpoint(model_checkpoint, duration, ic,
     (real-world only) - so none of the checkpoint's own configuration
     (lmax/tau/grid/... or resol/nfuture/.../index) needs to be re-supplied
     here; it's read straight off the path string.
+
+    For a neural checkpoint, single_name/multi_name (see neural_model_path)
+    both live under the SAME model_dir, so without a further split here a
+    single-step and a multi-step rollout from that same checkpoint would
+    collide on one output path. single_step therefore picks a trailing
+    single/ or multi/ leaf directory in that case; ignored for a numerical
+    checkpoint (single_step is meaningless there - see run()'s docstring).
     """
+    is_neural = is_neural_checkpoint(model_checkpoint)
+
     parts = list(Path(model_checkpoint).parts)
     try:
         idx = parts.index("checkpoints")
@@ -408,6 +447,9 @@ def _data_path_from_checkpoint(model_checkpoint, duration, ic,
     else:
         file_name = "model_output.pt"
 
+    if is_neural:
+        parts += ["single" if single_step else "multi"]
+
     directory = os.path.join(*parts)
     return directory, file_name
 
@@ -443,7 +485,26 @@ def run(model_checkpoint,
                               dataset (the rollout being run), which need not
                               be the dataset model_checkpoint was itself
                               built/trained against.
-            save_interval_minutes: interval to save in simulation time, minutes.
+            save_interval_minutes: REQUESTED interval between saved frames,
+                              minutes. Drives number_of_frames for both branches
+                              (so two calls sharing the same duration/
+                              save_interval_minutes stay frame-aligned) and, for
+                              the numerical branch, the substep count (via
+                              compute_step_per_save). The numerical branch can
+                              only realize an integer number of solver substeps
+                              per frame, so the REAL elapsed time per frame is
+                              usually a slightly different value - see
+                              true_cadence_minutes. That achieved value (not
+                              this requested one) is what gets written into the
+                              output .pt's metadata as 'true_interval_minutes' -
+                              the single source of truth every downstream
+                              consumer (SWEDataset, training, inference) reads
+                              back instead of re-deriving it from a nominal
+                              number. A caller that wants a reference
+                              trajectory to match another trajectory's own
+                              already-realized cadence (e.g. a neural rollout's
+                              n_future * true_interval_minutes) should simply
+                              pass that value here directly.
             single_step:      use single step model if True, else multistep.
             phi_eq_spec:      required when model_checkpoint is a numerical checkpoint
                               with rad=True (see ShallowWaterSolver's rad/tau_rad) -
@@ -477,6 +538,7 @@ def run(model_checkpoint,
     output_dir, file_name = _data_path_from_checkpoint(
         model_checkpoint, duration, ic,
         pressure=pressure, ic_time=ic_time, dataset_name=dataset_name,
+        single_step=single_step,
     )
 
     # resolved before touching model_checkpoint's own model_info.json at all,
@@ -519,17 +581,28 @@ def run(model_checkpoint,
         n_future = model_info['n_future']
         nlat, nlon = model_info['nlat'], model_info['nlon']
         grid = model_info.get('grid', 'equiangular')
-        # minutes between consecutive training frames the model was trained on -
-        # 30 for PS-solver output (historical default), the real ERA5 cadence
-        # (e.g. 60) for ERA5-direct training data (see dataset.py/train_singlestep.py).
-        train_interval_minutes = model_info.get('save_interval_minutes', 30)
+        # real elapsed minutes between consecutive training frames - the
+        # ACHIEVED cadence recorded by whatever produced the training data
+        # (run()'s numerical branch below, or build_era5_trajectory_dataset.py
+        # for ERA5-direct data), not a nominal/requested one. The model's own
+        # lead time per autoregressive call is n_future * train_interval_minutes
+        # - this is the golden-standard quantity everything downstream (here,
+        # SWEDataset, inference.py) keys off instead of an assumed nominal
+        # number - see stage0.md Findings (frame-cadence rounding drift).
+        train_interval_minutes = model_info['true_interval_minutes']
+        model_lead_minutes = train_interval_minutes * n_future
 
-        if save_interval_minutes % (train_interval_minutes * n_future) != 0:
+        # save_interval_minutes may carry the same floating-point rounding a
+        # caller derived it with (e.g. inference.py's n_future*true_interval_minutes),
+        # so compare via a rounded ratio rather than an exact '%' on floats.
+        steps_ratio = save_interval_minutes / model_lead_minutes
+        model_steps_per_save = max(1, round(steps_ratio))
+        if abs(steps_ratio - model_steps_per_save) > 1e-6 * max(model_steps_per_save, 1):
             raise RuntimeError(
-                f"When running neural operators, save interval must be an integer "
-                f"multiple of {train_interval_minutes * n_future} minutes")
-        # number of autoregressive model calls between two saved frames
-        model_steps_per_save = max(1, int(save_interval_minutes // (train_interval_minutes * n_future)))
+                f"When running neural operators, save interval ({save_interval_minutes} min) "
+                f"must be an integer multiple of the model's own lead time "
+                f"({model_lead_minutes} min = n_future({n_future}) * true_interval_minutes"
+                f"({train_interval_minutes}))")
 
         run_log_content = {
             "title": "Running Single-Step SFNO Inference",
@@ -600,6 +673,10 @@ def run(model_checkpoint,
                         state = out if target_mode == 'absolute' else state + out
         end_sim_time = time.perf_counter()
         print(f"⏰ Finished model inference in {end_sim_time - start_sim_time:.3f} seconds")
+        # the neural branch's saved cadence is an EXACT integer multiple of the
+        # model's own (already float-rounded) lead time - no further rounding
+        # is introduced here, so this is what actually got realized, not just
+        # what was requested.
         data = {
             'metadata': {
                 'nlat': nlat,
@@ -609,7 +686,7 @@ def run(model_checkpoint,
                 'grid': grid,
                 'n_future': n_future,
                 'step_per_save': model_steps_per_save,
-                'save_interval_minutes': save_interval_minutes,
+                'true_interval_minutes': model_steps_per_save * model_lead_minutes,
             },
             'trajectory': trajectory,
         }
@@ -638,17 +715,21 @@ def run(model_checkpoint,
 
         uspec = initial_condition.to(device)
 
-        # number of solver steps between two saved frames. solver.dt is in units of
-        # solver.T (=1 second when the solver is dimensional), so convert the physical
-        # save_interval into solver.dt's own units before dividing.
+        # number of solver steps between two saved frames, by interpolating to
+        # the NEAREST achievable integer substep count for the requested
+        # save_interval_minutes (see compute_step_per_save) - the real elapsed
+        # time this actually realizes (true_interval_minutes, below) is what
+        # gets recorded into the output metadata, not the request itself.
         solver_T = getattr(solver, 'T', 1.0)
-        step_per_save = max(1, round(save_interval_minutes * 60.0 / (solver.dt * solver_T)))
+        step_per_save = compute_step_per_save(save_interval_minutes, solver.dt, solver_T)
+        true_interval_minutes = true_cadence_minutes(save_interval_minutes, solver.dt, solver_T)
 
         run_log_content = {
             "title": "Running Psuedo-Spectral Solver",
             "lines": [
-                f"Days : {duration} | save_interval : {save_interval_minutes}(minutes) | Total frames = {number_of_frames}",
-                f"dt = {solver.dt:.4g} ({'non-dim' if getattr(solver, 'non_dimensional', False) else 's'}) | step_per_save = {step_per_save}"
+                f"Days : {duration} | save_interval requested : {save_interval_minutes}(minutes) | Total frames = {number_of_frames}",
+                f"dt = {solver.dt:.4g} ({'non-dim' if getattr(solver, 'non_dimensional', False) else 's'}) | "
+                f"step_per_save = {step_per_save} (true_interval_minutes = {true_interval_minutes:.2f} min)"
                 # f"output_dir = {output_dir} | file_name = {file_name}",
             ],
         }
@@ -685,7 +766,7 @@ def run(model_checkpoint,
                 'mmax': solver.mmax,
                 'grid': solver.grid,
                 'step_per_save': step_per_save,
-                'save_interval_minutes': save_interval_minutes,
+                'true_interval_minutes': true_interval_minutes,
                 # provenance only - the trajectory above is always physical.
                 'non_dimensional': non_dimensional,
                 'T': T,

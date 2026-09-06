@@ -64,7 +64,7 @@ def _common_setup(data, device="cpu"):
     lons = solver.lons.detach().cpu().numpy()
 
     step_per_save = metadata.get("step_per_save")
-    sec_per_frame = metadata["save_interval_minutes"] * 60 
+    sec_per_frame = metadata["true_interval_minutes"] * 60
 
     return solver, trajectory, lats, lons, sec_per_frame
 

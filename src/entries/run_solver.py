@@ -123,11 +123,11 @@ def plot_trajectory_diagnostics(save_path, output_dir):
     """
     data = torch.load(save_path, weights_only=False)
     trajectory = data["trajectory"]  # (N, 3, lmax, mmax) complex: phi, vrt, div
-    save_interval_minutes = data["metadata"]["save_interval_minutes"]
+    true_interval_minutes = data["metadata"]["true_interval_minutes"]
 
     sqrt_4pi = float(4.0 * np.pi) ** 0.5
     n_frames = trajectory.shape[0]
-    hours = np.arange(n_frames) * save_interval_minutes / 60.0
+    hours = np.arange(n_frames) * true_interval_minutes / 60.0
 
     fig, ax = plt.subplots(3, figsize=(8, 4.5))
     for i, name in enumerate(["geopotential", "vorticity", "divergence"]):
