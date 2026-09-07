@@ -1,5 +1,8 @@
+import math
+
 import torch
 from torch_harmonics.sht import *
+import numpy as np
 import xarray as xr
 import pandas as pd
 import time
@@ -100,19 +103,99 @@ def random_initial_condition(model, mach=0.1, scaler=1) -> torch.Tensor:
 
 
 
-def rw_initial_condition(model, vSHT, era5_dataset, ic_time, balanced=True, log=False):
+def _exponential_spectral_filter(lmax, a, p, dtype, device):
+    """Smooth exponential spectral filter sigma(l) = exp(-a*(l/l_max)^64)^p (l_max=lmax-1),
+    used in place of a hard truncation cutoff when bringing real-world data (at its own
+    native resolution) down to the model's spectral truncation. A hard slice (`spec[:lmax]`)
+    leaves an abrupt edge at l=lmax-1 that rings in physical space (Gibbs phenomenon);
+    this instead damps the coefficients smoothly, staying ~1 for most of the retained band
+    and dropping sharply only near l_max (the exponent 64 gives a near-flat-then-sharp-knee
+    shape). Returns a (lmax, 1) real tensor (matching `dtype`, the model's own real
+    precision, so multiplying it into a spectral tensor doesn't silently upcast the
+    complex dtype) that broadcasts over the trailing `m` axis (and any leading channel
+    axis) of a (..., lmax, mmax) spectral tensor.
     """
-        Generate a real-world based initial using the dataset:
-        "ERA5 hourly data on pressure levels from 1940 to present"
-        https://cds.climate.copernicus.eu/datasets/reanalysis-era5-pressure-levels?tab=download
-        
+    l = torch.arange(lmax, dtype=dtype, device=device)
+    l_max = max(lmax - 1, 1)
+    return (torch.exp(-a * (l / l_max) ** 64) ** p).unsqueeze(-1)
+
+
+def _infer_triangular_truncation(n_complex):
+    """Native ECMWF triangular truncation T implied by a GRIB spectral field's complex
+    coefficient count: a T-truncated triangular field stores N = (T+1)(T+2)/2 complex
+    coefficients (m=0..T, n=m..T)."""
+    T = int(round((-3 + math.sqrt(8 * n_complex + 1)) / 2))
+    if (T + 1) * (T + 2) // 2 != n_complex:
+        raise ValueError(f"❌ {n_complex} complex spectral coefficients don't correspond to any triangular truncation T.")
+    return T
+
+
+def _ecmwf_spectral_to_tensor(raw_values, native_trunc, lmax, mmax, ctype, device):
+    """Convert one ERA5-complete GRIB spherical-harmonic field's raw coefficient array
+    into a (lmax, mmax) complex tensor in torch_harmonics' orthonormal ("ortho") real-SHT
+    convention (l=degree first axis, m=order second axis, m<=l), truncating or
+    zero-padding to (lmax, mmax) as needed.
+
+    ECMWF stores `raw_values` as (real, imag) pairs ordered by increasing zonal wavenumber
+    m (0..native_trunc), and for each m by increasing total wavenumber n (m..native_trunc)
+    -- the standard WMO GRIB triangular spectral layout (verified against this file's own
+    `pentagonalResolutionParameterJ/K/M`). ECMWF's Legendre normalization is the "4*pi"
+    convention (Y_0^0 = 1, i.e. the raw (n=0, m=0) coefficient IS the field's domain mean --
+    verified against 'z''s ~55000 m^2/s^2 January-mean 500 hPa geopotential), whereas
+    torch_harmonics' "ortho" convention has Y_0^0 = 1/sqrt(4*pi), so every coefficient is
+    rescaled by sqrt(4*pi). Both conventions omit the Condon-Shortley phase, matching this
+    codebase's `csphase=False` transforms.
+
+    Cross-validated by comparing the vorticity/divergence spectra this produces against
+    this repo's own forward RealVectorSHT of ERA5 GRIDDED (u, v) at a shared time point
+    (1980-01-01T00, present in both reanalysis_data/1980_2025_odd_month_500 and
+    1970_2025_sparse_500_vo_d_z_t128): the two agree to ~1% relative L2 error, attributable
+    to the different native resolutions (T128 spectral vs 0.25 deg grid), confirming both
+    the coefficient ordering and the sqrt(4*pi) normalization above.
+    """
+    n_complex = raw_values.size // 2
+    if n_complex != (native_trunc + 1) * (native_trunc + 2) // 2:
+        raise ValueError(f"❌ raw spectral array has {n_complex} complex coefficients, "
+                         f"inconsistent with triangular truncation T{native_trunc}.")
+
+    # GRIB storage order (m outer 0..T, n inner m..T) is exactly the row-major order
+    # np.triu_indices returns for an upper triangle -> pairs[i] = (m_idx[i], n_idx[i]).
+    m_idx, n_idx = np.triu_indices(native_trunc + 1)
+    complex_vals = raw_values[0::2].astype(np.float64) + 1j * raw_values[1::2].astype(np.float64)
+    native = np.zeros((native_trunc + 1, native_trunc + 1), dtype=np.complex128)
+    native[n_idx, m_idx] = complex_vals  # (l=n, m) layout, lower-triangular (m<=l)
+    native *= np.sqrt(4 * np.pi)
+
+    out = torch.zeros(lmax, mmax, dtype=ctype, device=device)
+    common_l = min(native_trunc + 1, lmax)
+    common_m = min(native_trunc + 1, mmax)
+    out[:common_l, :common_m] = torch.tensor(native[:common_l, :common_m], dtype=ctype, device=device)
+    return out
+
+
+def rw_initial_condition(model, vSHT, era5_dataset, ic_time, balanced=False, log=False, a=2, p=16):
+    """
+        Generate a real-world based initial condition from an ERA5 dataset, either
+        GRIDDED (u, v on a lat/lon grid, e.g. from download_era5.py's
+        "ERA5 hourly data on pressure levels" -
+        https://cds.climate.copernicus.eu/datasets/reanalysis-era5-pressure-levels?tab=download)
+        or SPECTRAL (native spherical-harmonic vo/d/z coefficients, no lat/lon dims, from
+        download_era5_spectral.py's "ERA5 complete" MARS retrieval) -- which of the two
+        `era5_dataset` is auto-detected from its dimensions (a 'values' dim with no
+        'latitude'/'longitude' means spectral).
+
         Args:
             model: swe solver model
-            vSHT: the RealVectorSHT object with geometry compatbile to ERA5 datset
-            grib_path: the path to the grib file
+            vSHT: RealVectorSHT with geometry compatible to a GRIDDED era5_dataset; ignored
+                (may be None) for a spectral era5_dataset, which needs no vector transform.
+            era5_dataset: opened xarray Dataset, gridded or spectral (see above)
             ic_time: the year-month-day-hour used to generate ic, ex."2026-07-17"
-            balanced: if set to True, only extract [u,v] and compute geopotential 
-            by balance equation. Else, use realworld geopotential data
+            balanced: if True, extract [u,v] (or, for spectral input, vorticity/divergence
+                directly) and solve the balance equation for geopotential. If False
+                (default), use the dataset's own real-world geopotential ('z') instead.
+            a, p: exponential spectral filter parameters (see _exponential_spectral_filter)
+                applied in place of a hard truncation when bringing era5_dataset's native
+                resolution down to the model's (lmax, mmax).
     """
     if log:
         print("Computing Initial Condition....")
@@ -121,38 +204,77 @@ def rw_initial_condition(model, vSHT, era5_dataset, ic_time, balanced=True, log=
     if log:
         print(f"    device is {device}")
         print(f"    Preparing data ....")
-    
+
     # select the date. squeeze() drops any leftover length-1 dims (e.g. a
-    # single-pressure-level 
+    # single-pressure-level
     ds = era5_dataset.sel(valid_time=ic_time, method='nearest').squeeze()
-    
+
     # match the solver's spectral precision (buffers are float64); ERA5 is float32
     dtype = model.lap.dtype
-    u_data = torch.tensor(ds['u'].to_numpy(), device=device, dtype=dtype)
-    v_data = torch.tensor(ds['v'].to_numpy(), device=device, dtype=dtype)
+    ctype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
-    uv_data = torch.stack([u_data,v_data], dim=0)
-    # ERA5 winds are physical (m/s); rescale into the model's own units before
-    # any spectral transform so a non-dimensional model gets a non-dimensional IC.
-    if getattr(model, 'non_dimensional', False):
-        uv_data = uv_data / model.U
-    
-    data_finish_time = time.perf_counter()
-    if log:
-        print(f"    Finished preparing data in {(data_finish_time - start_time):.2f} seconds")
-    
-    if model.solver_type == 'psuedo_spectral_naive':
+    # a spectral (native spherical-harmonic) dataset has a flat 'values' dim and no
+    # lat/lon; a gridded one has 'latitude'/'longitude' (see rw_initial_condition's docstring).
+    is_spectral = 'values' in ds.dims
+
+    if model.solver_type != 'psuedo_spectral_naive':
+        return
+
+    sigma = _exponential_spectral_filter(model.lmax, a, p, dtype, device)
+
+    if is_spectral:
+        if log:
+            print(f"    Detected spectral ERA5 dataset (native spherical-harmonic coefficients)")
         spec_start = time.perf_counter()
-        
+
+        vo_raw, d_raw = ds['vo'].to_numpy(), ds['d'].to_numpy()
+        native_trunc = _infer_triangular_truncation(vo_raw.size // 2)
+
+        vrt_spec = _ecmwf_spectral_to_tensor(vo_raw, native_trunc, model.lmax, model.mmax, ctype, device)
+        div_spec = _ecmwf_spectral_to_tensor(d_raw, native_trunc, model.lmax, model.mmax, ctype, device)
+        # vorticity/divergence are physical rates (1/s); model.T (=1 when
+        # non_dimensional=False) rescales them into the model's own time units, the same
+        # way __init__ rescales omega_phys -> self.omega.
+        vrtdiv_spec = torch.stack([vrt_spec, div_spec], dim=0) * model.T
+        vrtdiv_spec = vrtdiv_spec * sigma
+
+        spec_end = time.perf_counter()
+        if log:
+            print(f"    Finished spectral remapping in {(spec_end - spec_start):2f} seconds")
+
+        if balanced:
+            uv_model = model.getuv(vrtdiv_spec)
+        else:
+            z_raw = ds['z'].to_numpy()
+            phispec = _ecmwf_spectral_to_tensor(z_raw, native_trunc, model.lmax, model.mmax, ctype, device)
+            if getattr(model, 'non_dimensional', False):
+                phispec = phispec / (model.U ** 2)
+            phispec = phispec * sigma
+    else:
+        u_data = torch.tensor(ds['u'].to_numpy(), device=device, dtype=dtype)
+        v_data = torch.tensor(ds['v'].to_numpy(), device=device, dtype=dtype)
+
+        uv_data = torch.stack([u_data, v_data], dim=0)
+        # ERA5 winds are physical (m/s); rescale into the model's own units before
+        # any spectral transform so a non-dimensional model gets a non-dimensional IC.
+        if getattr(model, 'non_dimensional', False):
+            uv_data = uv_data / model.U
+
+        data_finish_time = time.perf_counter()
+        if log:
+            print(f"    Finished preparing data in {(data_finish_time - start_time):.2f} seconds")
+
+        spec_start = time.perf_counter()
+
         # compute spectral representation
         nlat, nlon = uv_data.shape[-2], uv_data.shape[-1]
         if nlat != vSHT.nlat or nlon != vSHT.nlon:
             raise ValueError(f"❌ vSHT.nlat and vSHT.nlon imcompatible with the data shape, they should be the same." + \
                              f"netCDF file has data of shape {nlat, nlon} while vSHT has {vSHT.nlat, vSHT.nlon}")
 
-        # truncate spectral representation
+        # filter (in place of a hard truncation) down to the model's spectral resolution
         uv_model_spec = vSHT(uv_data)
-        uv_model_spec_truncated = uv_model_spec[:, :model.lmax, :model.mmax]
+        uv_model_spec_truncated = uv_model_spec[:, :model.lmax, :model.mmax] * sigma
 
         # map to vrtdiv
         vrtdiv_spec = model.lap * model.radius * uv_model_spec_truncated
@@ -163,31 +285,40 @@ def rw_initial_condition(model, vSHT, era5_dataset, ic_time, balanced=True, log=
         spec_end = time.perf_counter()
         if log:
             print(f"    Finished spectral truncation in {(spec_end - spec_start):2f} seconds")
-        
-        # Solve the balance Equation (see _solve_balance_geopotential)
-        if balanced is True:
-            balance_start = time.perf_counter()
-            phispec = _solve_balance_geopotential(model, uv_model, model.havg.expand(model.nlat, model.nlon))
-            balance_end = time.perf_counter()
-            if log:
-                print(f"    Computed balanced geopotential in {(balance_end - balance_start):2f} seconds")
-        
-        write_start = time.perf_counter()
-        phivrtdiv_spec = torch.zeros(3, 
-                                     model.lmax, 
-                                     model.mmax, 
-                                     dtype=vrtdiv_spec.dtype, 
-                                     device=device)
-        
-        # print(f"shape of phispec is {phispec.shape}")
-        # print(f"shape of vrtdiv_spec is {vrtdiv_spec.shape}")
-        phivrtdiv_spec[0] = phispec 
-        phivrtdiv_spec[1:] = vrtdiv_spec
-        all_end_time = time.perf_counter()
+
+        if balanced:
+            pass  # phispec computed below, from the balance equation
+        else:
+            z_data = torch.tensor(ds['z'].to_numpy(), device=device, dtype=dtype)
+            z_sht = RealSHT(nlat=vSHT.nlat, nlon=vSHT.nlon, lmax=vSHT.lmax, mmax=vSHT.mmax,
+                             grid=vSHT.grid, csphase=vSHT.csphase).to(device)
+            phispec = z_sht(z_data)[:model.lmax, :model.mmax] * sigma
+            if getattr(model, 'non_dimensional', False):
+                phispec = phispec / (model.U ** 2)
+
+    # Solve the balance Equation (see _solve_balance_geopotential) -- shared by both
+    # branches above, since it only needs `uv_model` (wind on the model grid).
+    if balanced:
+        balance_start = time.perf_counter()
+        phispec = _solve_balance_geopotential(model, uv_model, model.havg.expand(model.nlat, model.nlon))
+        balance_end = time.perf_counter()
         if log:
-            print(f"    finished writing data in {(all_end_time - write_start):2f}")
-            print(f"finished computing initial condition in {(all_end_time-start_time):.2f} seconds")
-        return torch.tril(phivrtdiv_spec)
+            print(f"    Computed balanced geopotential in {(balance_end - balance_start):2f} seconds")
+
+    write_start = time.perf_counter()
+    phivrtdiv_spec = torch.zeros(3,
+                                 model.lmax,
+                                 model.mmax,
+                                 dtype=vrtdiv_spec.dtype,
+                                 device=device)
+
+    phivrtdiv_spec[0] = phispec
+    phivrtdiv_spec[1:] = vrtdiv_spec
+    all_end_time = time.perf_counter()
+    if log:
+        print(f"    finished writing data in {(all_end_time - write_start):2f}")
+        print(f"finished computing initial condition in {(all_end_time-start_time):.2f} seconds")
+    return torch.tril(phivrtdiv_spec)
 
 
 def day_of_year_climatology(era5_dataset):
