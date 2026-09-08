@@ -20,12 +20,13 @@ from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from torch_harmonics.sht import RealVectorSHT
 from src.numerical_solver.initial_condition import rw_initial_condition
 
-def compute_h_stats_ic(netcdf_path, 
-                       nlat_data=721, 
-                       nlon_data=1440, 
-                       lmax_model=64, 
-                       grid="equiangular", 
-                       dealias=False):
+def compute_h_stats_ic(netcdf_path,
+                       nlat_data=721,
+                       nlon_data=1440,
+                       lmax_model=64,
+                       grid="equiangular",
+                       dealias=False,
+                       max_seconds=300):
     """
     For every time point in `netcdf_path`, reconstruct the balanced geopotential
     spectrum via rw_initial_condition (src.numerical_solver.initial_condition,
@@ -47,24 +48,33 @@ def compute_h_stats_ic(netcdf_path,
         nlat_data, nlon_data : the shape of the ERA5 dataset
         lmax_model, grid, dealias : solver resolution/config used to reconstruct the
             balanced fields (see ShallowWaterSolver)
+        max_seconds : abort (and return only the time points already computed) if the
+            loop runs longer than this; None disables the cap entirely. Guards against
+            an accidentally huge dataset hanging the (usually login-node) caller.
 
     Returns:
-        h_avg, h_amp, year : 1-D numpy arrays, one entry per time point in
-            `netcdf_path`'s 'valid_time' coordinate, in file order.
+        h_avg, h_amp, year : 1-D numpy arrays, one entry per time point actually
+            computed (in file order) -- shorter than `netcdf_path`'s full 'valid_time'
+            coordinate if max_seconds cut the loop short.
     """
     start_time = time.perf_counter()
     # this function derives h_avg/h_amp themselves, so the solver used to
     # reconstruct the balanced geopotential must stay in physical units.
     model = ShallowWaterSolver(lmax=lmax_model, grid=grid, dealias=dealias, non_dimensional=False)
     model.to(model.device)
-    
-    vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data// 2, mmax=nlat_data // 2,
-                        grid='equiangular', csphase=False).to(model.device)
-    
+
     start_load_time=time.perf_counter()
     era5_dataset = xr.open_dataset(netcdf_path).load()
     finish_load_time=time.perf_counter()
     print(f"Finished loading data in {(finish_load_time - start_load_time):2f} seconds")
+
+    # a spectral (native spherical-harmonic vo/d/z) dataset needs no vSHT -
+    # rw_initial_condition ignores it for that branch (see its docstring); skip building
+    # the (nontrivially expensive, ~10s at 721x1440) vector SHT when it won't be used.
+    vSHT = None
+    if 'values' not in era5_dataset.dims:
+        vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data// 2, mmax=nlat_data // 2,
+                            grid='equiangular', csphase=False).to(model.device)
 
     times = np.atleast_1d(era5_dataset["valid_time"].values)
 
@@ -73,15 +83,16 @@ def compute_h_stats_ic(netcdf_path,
     h_avg = np.empty(len(times), dtype=np.float64)
     h_amp = np.empty(len(times), dtype=np.float64)
     year = np.empty(len(times), dtype=np.int32)
-    
 
+    n_done = len(times)
     with torch.no_grad():
         for i, t in enumerate(tqdm.tqdm(times, desc="Computing h_avg/h_amp")):
-            if i % 10 == 0:
+            if max_seconds is not None and i % 10 == 0:
                 curr_time=time.perf_counter()
-                if (curr_time-start_time) > 300:
-                    print("Taking too long(> 300 s), killing the job")
-                    break 
+                if (curr_time-start_time) > max_seconds:
+                    print(f"Taking too long (> {max_seconds}s); stopping after {i}/{len(times)} time points")
+                    n_done = i
+                    break
             ic_time = str(np.datetime_as_string(t, unit="s"))
             uspec = rw_initial_condition(model, vSHT, era5_dataset, ic_time, balanced=True)
             phispec = uspec[0]  # (lmax, mmax) spectral geopotential
@@ -95,16 +106,18 @@ def compute_h_stats_ic(netcdf_path,
             h_amp[i] = (torch.sqrt(phi_var) / model.gravity).item()
             year[i] = t.astype("datetime64[Y]").astype(int) + 1970
 
-    return h_avg, h_amp, year
+    # trim to what was actually computed -- the rest of the pre-allocated arrays
+    # is uninitialized memory (np.empty) when max_seconds cut the loop short.
+    return h_avg[:n_done], h_amp[:n_done], year[:n_done]
 
 
 
-def plot_h_stats_ic(data_name):
+def plot_h_stats_ic(data_name, max_seconds=300):
     netcdf_path = f"reanalysis_data/{data_name}/data.nc"
     stats_path = f"reanalysis_data/{data_name}/h_stats.npz"
     fig_path = f"reanalysis_data/{data_name}/h_stats_plot.png"
-    h_avgs, h_amps, date = compute_h_stats_ic(netcdf_path)
-    
+    h_avgs, h_amps, date = compute_h_stats_ic(netcdf_path, max_seconds=max_seconds)
+
     time_averaged_stat = np.array([h_avgs.mean(), h_amps.mean()])
     np.savez(stats_path, h_avgs=h_avgs,h_amps=h_amps, dates=date, mean=time_averaged_stat)
     fig, ax = plt.subplots()

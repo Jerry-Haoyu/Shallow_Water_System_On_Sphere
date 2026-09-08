@@ -382,10 +382,23 @@ def is_neural_checkpoint(model_checkpoint):
 
 def _data_path_from_checkpoint(model_checkpoint, duration, ic,
                                pressure=None, ic_time=None, dataset_name=None,
-                               single_step=True):
+                               single_step=True, filter_a=None, filter_p=None):
     """(directory, file_name) of a run's trajectory output, derived entirely
     from `model_checkpoint`'s own path plus the data-specific info a single
     checkpoint doesn't pin down (duration, ic, ...).
+
+    filter_a, filter_p: the exponential spectral filter parameters
+        rw_initial_condition applied when generating this trajectory's initial
+        condition (see initial_condition.py) - real_world only. They don't
+        affect the solver/checkpoint itself (a one-time IC-generation knob,
+        not solver dynamics), so they tag the FILENAME only, not a new
+        directory level - SWEDataset (src/neural_operator/dataset.py) globs
+        "*.pt" non-recursively in a dataset_<name>/ directory, so adding a
+        directory level here would silently stop it from finding any
+        trajectories. A run with different filter_a/filter_p is a genuinely
+        different initial condition and must not collide with (or be silently
+        skipped in favor of) another run's cached trajectory at the same
+        ic_time, hence still tagging *something* in the path.
 
     The data tree is isomorphic to the checkpoint tree (README.md): the same
     config-identifying prefix, rooted at model_output/ instead of
@@ -443,7 +456,8 @@ def _data_path_from_checkpoint(model_checkpoint, duration, ic,
                 "tied to any one real-world dataset)."
             )
         parts += [f"pressure_{pressure}", f"dataset_{dataset_name}"]
-        file_name = f"{_date_tag(ic_time)}.pt"
+        filter_tag = f"_filter_a{filter_a:g}_p{filter_p:g}" if (filter_a is not None or filter_p is not None) else ""
+        file_name = f"{_date_tag(ic_time)}{filter_tag}.pt"
     else:
         file_name = "model_output.pt"
 
@@ -463,7 +477,9 @@ def run(model_checkpoint,
         dataset_name=None,
         save_interval_minutes=30,
         single_step=True,
-        phi_eq_spec=None):
+        phi_eq_spec=None,
+        filter_a=None,
+        filter_p=None):
     """
         A ubiquitous interface for both inferencing SFNO and psuedospectral simulation.
         Generates a .pt file of prediction data, then returns its path.
@@ -477,6 +493,14 @@ def run(model_checkpoint,
             ic:               "galewsky" or "real_world" (naming convention).
             pressure, ic_time: required when ic == "real_world" (naming
                               convention only; ic_time also selects the IC).
+            filter_a, filter_p: the exponential spectral filter parameters used to
+                              build `initial_condition` (real_world only - see
+                              initial_condition.rw_initial_condition). Purely a
+                              naming-convention/cache-key input here: different
+                              filter_a/filter_p branch onto a different path (see
+                              _data_path_from_checkpoint) so a re-run with a
+                              different filter doesn't silently reuse another
+                              filter setting's cached trajectory.
             dataset_name:     required when ic == "real_world", *except* a
                               numerical checkpoint already tied to one dataset
                               (see numerical_checkpoint_path) - passing a
@@ -538,7 +562,7 @@ def run(model_checkpoint,
     output_dir, file_name = _data_path_from_checkpoint(
         model_checkpoint, duration, ic,
         pressure=pressure, ic_time=ic_time, dataset_name=dataset_name,
-        single_step=single_step,
+        single_step=single_step, filter_a=filter_a, filter_p=filter_p,
     )
 
     # resolved before touching model_checkpoint's own model_info.json at all,

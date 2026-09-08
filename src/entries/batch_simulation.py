@@ -64,6 +64,10 @@ DEFAULT_CONFIG = {
     "duration": 5,                   # days
     "save_interval_minutes": 30,
     "pressure": None,                # required (for naming), e.g. "500" or "(100,1000)"
+    # exponential spectral filter, forwarded into each job's run_solver config (see
+    # run_solver.py / initial_condition.rw_initial_condition): sigma=exp(-a*(l/lmax))^p
+    "a": 2,
+    "p": 16,
     "rad": False,                    # forwarded into each job's run_solver config (see run_solver.py)
     "tau_rad": None,
     "rad_smooth_fraction": 0.5,
@@ -101,6 +105,8 @@ def load_config():
     raw["stride"] = int(raw["stride"])
     raw["limit"] = int(raw["limit"]) if raw["limit"] is not None else None
     raw["cpus"] = int(raw["cpus"])
+    raw["a"] = float(raw["a"])
+    raw["p"] = float(raw["p"])
     raw["rad"] = bool(raw["rad"])
     raw["tau_rad"] = float(raw["tau_rad"]) if raw["tau_rad"] is not None else None
     raw["rad_smooth_fraction"] = float(raw["rad_smooth_fraction"])
@@ -178,6 +184,8 @@ def build_run_solver_config(ic_time, ic_data_path, cfg):
             "ic_time": ic_time,
             "ic_data_path": str(ic_data_path),
             "pressure": cfg.pressure,
+            "a": cfg.a,
+            "p": cfg.p,
             "rad": cfg.rad,
             "tau_rad": cfg.tau_rad,
             "rad_smooth_fraction": cfg.rad_smooth_fraction,

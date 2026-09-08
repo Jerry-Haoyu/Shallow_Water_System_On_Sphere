@@ -104,20 +104,20 @@ def random_initial_condition(model, mach=0.1, scaler=1) -> torch.Tensor:
 
 
 def _exponential_spectral_filter(lmax, a, p, dtype, device):
-    """Smooth exponential spectral filter sigma(l) = exp(-a*(l/l_max)^64)^p (l_max=lmax-1),
+    """Smooth exponential spectral filter sigma(l) = exp(-a*(l/l_max))^p (l_max=lmax-1),
     used in place of a hard truncation cutoff when bringing real-world data (at its own
     native resolution) down to the model's spectral truncation. A hard slice (`spec[:lmax]`)
     leaves an abrupt edge at l=lmax-1 that rings in physical space (Gibbs phenomenon);
-    this instead damps the coefficients smoothly, staying ~1 for most of the retained band
-    and dropping sharply only near l_max (the exponent 64 gives a near-flat-then-sharp-knee
-    shape). Returns a (lmax, 1) real tensor (matching `dtype`, the model's own real
-    precision, so multiplying it into a spectral tensor doesn't silently upcast the
-    complex dtype) that broadcasts over the trailing `m` axis (and any leading channel
-    axis) of a (..., lmax, mmax) spectral tensor.
+    this instead damps the coefficients smoothly and monotonically from l=0 (sigma=1)
+    down to l=l_max (sigma=exp(-a)^p), with a*p controlling how aggressively the whole
+    retained band is damped. Returns a (lmax, 1) real tensor (matching `dtype`, the
+    model's own real precision, so multiplying it into a spectral tensor doesn't silently
+    upcast the complex dtype) that broadcasts over the trailing `m` axis (and any leading
+    channel axis) of a (..., lmax, mmax) spectral tensor.
     """
     l = torch.arange(lmax, dtype=dtype, device=device)
     l_max = max(lmax - 1, 1)
-    return (torch.exp(-a * (l / l_max) ** 64) ** p).unsqueeze(-1)
+    return (torch.exp(-a * (l / l_max))**p).unsqueeze(-1)
 
 
 def _infer_triangular_truncation(n_complex):
@@ -328,8 +328,15 @@ def day_of_year_climatology(era5_dataset):
     also uses the same climatology for its baseline fields) compute this once and
     reuse it, rather than every radiative_equilibrium_geopotential call repeating the
     groupby over the full multi-year dataset.
+
+    Reduces over whichever dimension the 'valid_time' coordinate is actually indexed
+    by, rather than assuming it's named 'valid_time' itself: a gridded ERA5 dataset's
+    time dimension IS named 'valid_time', but a spectral (cfgrib-opened) dataset names
+    it 'time', with 'valid_time' only a coordinate on it - see rw_initial_condition's
+    spectral/grid auto-detection for the same grid-vs-spectral distinction.
     """
-    return era5_dataset.groupby('valid_time.dayofyear').mean('valid_time')
+    time_dim = era5_dataset['valid_time'].dims[0]
+    return era5_dataset.groupby('valid_time.dayofyear').mean(time_dim)
 
 
 def radiative_equilibrium_geopotential(model, vSHT, clim_ds, ic_time, smooth_fraction=0.5, log=False):

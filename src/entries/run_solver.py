@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
     "ic_data_path": None,           # optional (real_world): pre-sliced NetCDF (see batch_simulation.py)
                                      # to open instead of the full dataset_name/data.nc
     "pressure": None,               # for naming (real_world), e.g. 500
+    # exponential spectral filter applied by rw_initial_condition in place of a hard
+    # truncation when bringing real-world data down to lmax: sigma=exp(-a*(l/lmax))^p
+    "a": 2,
+    "p": 16,
     # radiative relaxation of geopotential (real_world ic only, see ShallowWaterSolver's
     # rad/tau_rad and initial_condition.radiative_equilibrium_geopotential)
     "rad": False,
@@ -88,6 +92,8 @@ def load_config():
     raw["rad"] = bool(raw["rad"])
     raw["tau_rad"] = float(raw["tau_rad"]) if raw["tau_rad"] is not None else None
     raw["rad_smooth_fraction"] = float(raw["rad_smooth_fraction"])
+    raw["a"] = float(raw["a"])
+    raw["p"] = float(raw["p"])
 
     cfg = SimpleNamespace(**raw)
 
@@ -182,7 +188,8 @@ def main():
         "lines": [
             f"lmax = {cfg.lmax} | tau = {cfg.tau} | grid = {cfg.grid} | semi_implicit = {cfg.semi_implicit}",
             f"duration = {cfg.duration} days | save_interval = {cfg.save_interval_minutes} min",
-            f"ic = {cfg.ic} | non_dimensional = {cfg.non_dimensional}",
+            f"ic = {cfg.ic} | non_dimensional = {cfg.non_dimensional}"
+            + (f" | filter a = {cfg.a} | filter p = {cfg.p}" if cfg.ic == "real_world" else ""),
             f"rad = {cfg.rad}" + (f" | tau_rad = {cfg.tau_rad} days | rad_smooth_fraction = {cfg.rad_smooth_fraction}" if cfg.rad else ""),
         ],
     })
@@ -236,21 +243,27 @@ def main():
         # the full (potentially large, multi-year) ERA5 dataset in every job.
         ic_source_path = Path(cfg.ic_data_path) if cfg.ic_data_path else netcdf_path
 
-        ds = xr.open_dataset(ic_source_path)
-        nlat_data, nlon_data = ds.sizes['latitude'], ds.sizes['longitude']
-        ds.close()
-        vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data// 2, mmax=nlat_data // 2,
-                            grid='equiangular', csphase=False).to(solver.device)
-
         start_load_time = time.perf_counter()
         era5_dataset = xr.open_dataset(ic_source_path).load()
         finish_load_time = time.perf_counter()
         print(f"Finished loading ERA5 data in {(finish_load_time - start_load_time):2f} seconds")
+
+        # gridded ERA5 (u, v on a latitude/longitude grid) needs a RealVectorSHT sized to
+        # its own resolution (see rw_initial_condition's grid branch); spectral ERA5
+        # (native spherical-harmonic vo/d/z, no lat/lon dims) needs none - rw_initial_condition
+        # remaps its coefficients directly and auto-detects which of the two this is.
+        vSHT = None
+        if 'latitude' in era5_dataset.dims and 'longitude' in era5_dataset.dims:
+            nlat_data, nlon_data = era5_dataset.sizes['latitude'], era5_dataset.sizes['longitude']
+            vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data // 2, mmax=nlat_data // 2,
+                                grid='equiangular', csphase=False).to(solver.device)
         phivrtdivspec_0 = rw_initial_condition(
             model=solver,
             vSHT=vSHT,
             era5_dataset=era5_dataset,
-            ic_time=cfg.ic_time)
+            ic_time=cfg.ic_time,
+            a=cfg.a,
+            p=cfg.p)
 
         if cfg.rad:
             # the day-of-year climatology needs the FULL multi-year dataset, but
@@ -277,6 +290,8 @@ def main():
         dataset_name=dataset_name,
         save_interval_minutes=cfg.save_interval_minutes,
         phi_eq_spec=phi_eq_spec,
+        filter_a=cfg.a if cfg.ic == "real_world" else None,
+        filter_p=cfg.p if cfg.ic == "real_world" else None,
     )
 
     plot_trajectory_diagnostics(save_path, Path(save_path).parent)
