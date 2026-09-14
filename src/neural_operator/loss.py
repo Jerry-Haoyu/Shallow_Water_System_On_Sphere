@@ -1,6 +1,6 @@
 import torch
 
-def l2loss_sphere(solver, prd, tar, relative=True, squared=False):
+def l2loss_sphere(solver, prd, tar, relative=True, squared=False, reduce_channels=True):
     # integrate_grid reduces (nlat, nlon) only and keeps the channel axis
     # (..., channel) - left alone here (no .sum(dim=-1)) so geopotential/
     # vorticity/divergence, which can differ by orders of magnitude, don't
@@ -16,11 +16,16 @@ def l2loss_sphere(solver, prd, tar, relative=True, squared=False):
 
     if not squared:
         loss = torch.sqrt(loss)
-    loss = loss.mean()  # average over batch AND channel, so each channel counts equally
+    # average over batch (and, unless reduce_channels=False, also over
+    # channel - a plain mean over a rectangular array, so reducing batch
+    # first then channel gives the identical scalar as one combined mean).
+    loss = loss.mean(dim=0)  # (channel,)
+    if reduce_channels:
+        loss = loss.mean()
 
     return loss
 
-def l1loss_sphere(solver, prd, tar, relative=True, squared=False):
+def l1loss_sphere(solver, prd, tar, relative=True, squared=False, reduce_channels=True):
     # akin to l2loss_sphere above but with an L1 (mean-absolute) norm instead
     # of an L2 (root-mean-square) one - squared/sqrt are meaningless for L1,
     # so `squared` is accepted only for a drop-in-compatible call signature
@@ -33,11 +38,13 @@ def l1loss_sphere(solver, prd, tar, relative=True, squared=False):
         tar_norm = solver.integrate_grid(torch.abs(tar), dimensionless=True)  # (..., channel)
         loss = loss / tar_norm.clamp_min(1e-12)
 
-    loss = loss.mean()  # average over batch AND channel, so each channel counts equally
+    loss = loss.mean(dim=0)  # (channel,) - see l2loss_sphere's reduce_channels note
+    if reduce_channels:
+        loss = loss.mean()
 
     return loss
 
-def spectral_l2loss_sphere(solver, prd, tar, relative=True, squared=False):
+def spectral_l2loss_sphere(solver, prd, tar, relative=True, squared=False, reduce_channels=True):
     # compute coefficients, keeping the channel axis separate from the degree
     # axis (summed below) so geopotential/vorticity/divergence - which can
     # differ by orders of magnitude depending on the input normalization -
@@ -60,7 +67,9 @@ def spectral_l2loss_sphere(solver, prd, tar, relative=True, squared=False):
 
     if not squared:
         loss = torch.sqrt(loss)
-    loss = loss.mean()  # average over batch AND channel, so each channel counts equally
+    loss = loss.mean(dim=0)  # (channel,) - see l2loss_sphere's reduce_channels note
+    if reduce_channels:
+        loss = loss.mean()
 
     return loss
 

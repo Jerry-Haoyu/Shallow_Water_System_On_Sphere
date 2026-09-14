@@ -30,9 +30,9 @@ from types import SimpleNamespace
 import torch
 import tqdm
 import xarray as xr
-import yaml
 from torch_harmonics import RealVectorSHT
 
+from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
 from src.helpers.run_model import load_h_stats
 from src.numerical_solver.initial_condition import rw_initial_condition
@@ -50,10 +50,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f) or {}
-    raw = DEFAULT_CONFIG | config.get("build_era5_trajectory", {})
+    raw = load_raw_config("build_era5_trajectory", DEFAULT_CONFIG)
     cfg = SimpleNamespace(**raw)
     if not cfg.dataset_name:
         raise ValueError("build_era5_trajectory.dataset_name is required.")

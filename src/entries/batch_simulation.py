@@ -1,4 +1,3 @@
-#!/data/gzhang13/a/hytang2/envs/swe/bin/python
 """
 Generate slurm scripts to batch numerical simulation with different initial
 conditions.
@@ -23,6 +22,14 @@ Configuration is read from the ``batch_simulation`` section of config.yml
 (pass an alternative path as the first CLI argument), matching the
 run_solver.py / inference.py convention.
 
+The generated sbatch scripts are cluster-agnostic by construction: every
+``#SBATCH`` directive and every ``module load`` line comes from config
+(the ``slurm knobs`` block below), not from anything hardcoded here. To
+migrate to a different slurm cluster, only config.yml's batch_simulation
+block needs to change (account/partition/gpu names, modules, python
+path) -- this file itself has no cluster-specific assumptions. The
+defaults here match NCSA Delta's convention (see .claude/skills/request-gpu).
+
 Example
 -------
     python -m src.entries.batch_simulation config.yml
@@ -39,9 +46,17 @@ import xarray as xr
 import yaml
 import subprocess
 
+from src.helpers.config import load_raw_config
+
 # project root = .../Shallow_Water_System_On_Sphere (this file lives in src/entries/)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PYTHON = "/data/gzhang13/a/hytang2/envs/swe/bin/python"
+# prefer this project's own venv (portable across clusters/checkouts); fall
+# back to whatever python is currently running this script.
+DEFAULT_PYTHON = (
+    str(PROJECT_ROOT / ".venv" / "bin" / "python")
+    if (PROJECT_ROOT / ".venv" / "bin" / "python").exists()
+    else sys.executable
+)
 
 
 DEFAULT_CONFIG = {
@@ -49,8 +64,9 @@ DEFAULT_CONFIG = {
     "dataset_name": None,            # required, e.g. "1980_2025_odd_month" -> reanalysis_data/<name>/data.nc
     "time_dim": "valid_time",
     "engine": None,                  # xarray engine (e.g. 'cfgrib' for grib); default: auto-detect
-    "stride": 1,                     # use every Nth time point
-    "limit": None,                   # only submit the first N (post-stride) time points
+    "time_filter": None,             # null | "first_of_month" (see _TIME_FILTERS); applied before stride/limit
+    "stride": 1,                     # use every Nth (post-filter) time point
+    "limit": None,                   # only submit the first N (post-filter, post-stride) time points
 
     # ------------------------- solver configuration --------------------------- #
     # forwarded into each job's own run_solver.py config
@@ -73,12 +89,20 @@ DEFAULT_CONFIG = {
     "rad_smooth_fraction": 0.5,
 
     # ----------------------------- slurm knobs --------------------------------- #
-    "partition": "gpu",
-    "account": "gzhang13-group",
-    "time_limit": "12:00:00",
-    "gres": "gpu:1",                 # pass "" to omit (CPU-only)
+    # Every one of these maps directly onto a generic sbatch flag or a raw
+    # extra line (see `modules` / `extra_sbatch`); there is nothing
+    # cluster-specific hardcoded in build_script(). To move to a different
+    # cluster, change only the values below.
+    "partition": "gpuA100x4",
+    "account": "bgvu-delta-gpu",
+    "time_limit": "00:01:00",        # #SBATCH --time; wall-clock budget per job, "HH:MM:SS"
+    "gpus_per_node": 1,               # #SBATCH --gpus-per-node; null/0 to omit (CPU-only)
     "mem": "32G",
     "cpus": 4,
+    "mail_user": None,                # #SBATCH --mail-user; null to omit
+    "mail_type": None,                # #SBATCH --mail-type, e.g. "BEGIN,END,FAIL"; null to omit
+    "modules": [],                    # `module load <name>` lines run before the job, e.g. ["cuda/12.4"]
+    "extra_sbatch": [],               # raw extra "#SBATCH ..." lines for anything cluster-specific
     "job_name_prefix": "swe_rw",
     "python": DEFAULT_PYTHON,
     "script_dir": "slurm_scripts",
@@ -90,11 +114,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file) or {}
-
-    raw = DEFAULT_CONFIG | config.get("batch_simulation", {})
+    raw = load_raw_config("batch_simulation", DEFAULT_CONFIG)
 
     # normalize types regardless of YAML formatting
     raw["lmax"] = int(raw["lmax"])
@@ -110,6 +130,10 @@ def load_config():
     raw["rad"] = bool(raw["rad"])
     raw["tau_rad"] = float(raw["tau_rad"]) if raw["tau_rad"] is not None else None
     raw["rad_smooth_fraction"] = float(raw["rad_smooth_fraction"])
+    raw["gpus_per_node"] = int(raw["gpus_per_node"]) if raw["gpus_per_node"] else None
+    raw["modules"] = list(raw["modules"] or [])
+    raw["extra_sbatch"] = list(raw["extra_sbatch"] or [])
+    raw["python"] = raw["python"] or DEFAULT_PYTHON
 
     cfg = SimpleNamespace(**raw)
 
@@ -119,10 +143,24 @@ def load_config():
         raise ValueError("batch_simulation.pressure is required (used for naming), e.g. 500.")
     if cfg.rad and cfg.tau_rad is None:
         raise ValueError("batch_simulation.tau_rad is required when rad=True.")
+    if cfg.time_filter is not None and cfg.time_filter not in _TIME_FILTERS:
+        raise ValueError(
+            f"batch_simulation.time_filter must be one of {list(_TIME_FILTERS)} or null, "
+            f"got {cfg.time_filter!r}."
+        )
     return cfg
 
 
-def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir, job_name_prefix):
+_TIME_FILTERS = {
+    # calendar-aware pre-filters, applied before stride/limit. Add more here
+    # as needed (keep them dataset-agnostic - they only look at the
+    # calendar fields of time_dim's own values).
+    "first_of_month": lambda t: (t.dt.day == 1) & (t.dt.hour == 0),
+}
+
+
+def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir,
+                       job_name_prefix, time_filter=None):
     """Open + load the (potentially large) ERA5 dataset exactly once, then
     write one small per-job NetCDF slice (one time point each) per selected
     job. Returns a list of (ic_time, ic_data_path) pairs, in job order.
@@ -131,6 +169,10 @@ def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir
     not squeezed away), so run_solver.py's existing
     ``era5_dataset.sel(valid_time=ic_time, method='nearest').squeeze()`` call
     works unchanged against each tiny slice file.
+
+    ``time_filter``, if given, is a key into ``_TIME_FILTERS`` (e.g.
+    "first_of_month") applied to narrow the candidate time points down by
+    calendar fields before ``stride``/``limit`` are applied.
     """
     netcdf_path = PROJECT_ROOT / "reanalysis_data" / dataset_name / "data.nc"
     ds = xr.open_dataset(netcdf_path, engine=engine)
@@ -139,8 +181,18 @@ def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir
             f"'{time_dim}' not found in {netcdf_path}. Available coords: {list(ds.coords)}"
         )
 
+    # time_dim may be a non-dimension coordinate (e.g. ERA5's "valid_time",
+    # indexed along a differently-named "time" dim) - isel() needs the
+    # actual dimension name, while sel()/values lookups work fine off
+    # time_dim itself either way.
+    time_index_dim = ds[time_dim].dims[0] if time_dim not in ds.dims else time_dim
+
     all_times = np.atleast_1d(ds[time_dim].values)
-    idxs = np.arange(len(all_times))[::stride]
+    idxs = np.arange(len(all_times))
+    if time_filter is not None:
+        mask = _TIME_FILTERS[time_filter](xr.DataArray(all_times)).values
+        idxs = idxs[mask]
+    idxs = idxs[::stride]
     if limit is not None:
         idxs = idxs[:limit]
 
@@ -158,7 +210,7 @@ def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir
 
         job_name = f"{job_name_prefix}_{i:04d}"
         ic_data_path = ic_data_dir / f"{job_name}_ic.nc"
-        ds.isel(**{time_dim: [idx]}).to_netcdf(ic_data_path)
+        ds.isel(**{time_index_dim: [idx]}).to_netcdf(ic_data_path)
 
         jobs.append((ic_time, ic_data_path))
 
@@ -203,6 +255,9 @@ def build_script(ic_time, ic_data_path, index, cfg, abs_config_dir, abs_log_dir)
         yaml.safe_dump(build_run_solver_config(ic_time, ic_data_path, cfg), sort_keys=False)
     )
 
+    # Every directive here comes straight from config (cfg.*) -- nothing
+    # cluster-specific is baked into this function itself, so retargeting the
+    # pipeline at a different slurm cluster only means editing config.yml.
     sbatch_lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
@@ -214,12 +269,23 @@ def build_script(ic_time, ic_data_path, index, cfg, abs_config_dir, abs_log_dir)
         f"#SBATCH --output={abs_log_dir}/{job_name}_%j.out",
         f"#SBATCH --error={abs_log_dir}/{job_name}_%j.err",
     ]
-    if cfg.gres:
-        sbatch_lines.insert(6, f"#SBATCH --gres={cfg.gres}")
+    if cfg.gpus_per_node:
+        sbatch_lines.append(f"#SBATCH --gpus-per-node={cfg.gpus_per_node}")
+    if cfg.mail_user:
+        sbatch_lines.append(f"#SBATCH --mail-user={cfg.mail_user}")
+    if cfg.mail_type:
+        sbatch_lines.append(f"#SBATCH --mail-type={cfg.mail_type}")
+    for line in cfg.extra_sbatch:
+        sbatch_lines.append(line if line.startswith("#SBATCH") else f"#SBATCH {line}")
 
     body = [
         "",
         "set -euo pipefail",
+    ]
+    if cfg.modules:
+        body.append("module purge")
+        body += [f"module load {name}" for name in cfg.modules]
+    body += [
         f"cd {PROJECT_ROOT}",
         f'echo "Running real-world simulation for ic_time={ic_time}"',
         # mirrors `make run_solver` (see makefile): run_solver.py is invoked as a
@@ -243,7 +309,7 @@ def main():
     print(f"Loading '{cfg.dataset_name}' once and slicing per-job initial conditions...")
     jobs = prepare_ic_slices(
         cfg.dataset_name, cfg.time_dim, cfg.engine, cfg.stride, cfg.limit,
-        ic_data_dir, cfg.job_name_prefix,
+        ic_data_dir, cfg.job_name_prefix, time_filter=cfg.time_filter,
     )
     if not jobs:
         sys.exit("No time points selected; nothing to submit.")

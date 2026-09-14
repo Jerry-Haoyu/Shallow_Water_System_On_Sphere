@@ -25,7 +25,6 @@ sys.path.insert(0, str(SRC_DIR))
 from types import SimpleNamespace
 
 import torch
-import yaml
 
 from src.analyze.visualization import (
     animate_swe_on_sphere,
@@ -34,6 +33,7 @@ from src.analyze.visualization import (
     plot_box_comparison,
     animate_spectrum as _animate_spectrum,
 )
+from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
 
 _PROJECTIONS = ("sphere", "box", "both")
@@ -70,9 +70,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config(task, config_path):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f) or {}
-    raw = DEFAULT_CONFIG[task] | (config.get(task) or {})
+    raw = load_raw_config(task, DEFAULT_CONFIG[task], config_path)
     cfg = SimpleNamespace(**raw)
     if getattr(cfg, "projection", "both") not in _PROJECTIONS:
         raise ValueError(f"{task}.projection must be one of {_PROJECTIONS}, got {cfg.projection!r}")

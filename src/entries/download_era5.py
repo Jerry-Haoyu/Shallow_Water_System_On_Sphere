@@ -27,8 +27,8 @@ from types import SimpleNamespace
 import cdsapi
 import numpy as np
 import xarray as xr
-import yaml
 
+from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
 from src.analyze.statistics import plot_h_stats_ic
 
@@ -48,11 +48,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file) or {}
-
-    raw = DEFAULT_CONFIG | config.get("download_era5", {})
+    raw = load_raw_config("download_era5", DEFAULT_CONFIG)
     cfg = SimpleNamespace(**raw)
 
     if not cfg.dataset_name:

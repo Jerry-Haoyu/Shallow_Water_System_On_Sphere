@@ -34,7 +34,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import xarray as xr
-import yaml
 import tqdm
 import json
 from datetime import datetime, timedelta
@@ -45,6 +44,7 @@ from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.numerical_solver.initial_condition import *
 from src.neural_operator.loss import LOSS_FUNCTIONS
 from src.analyze.visualization import plot_sphere_comparison, plot_box_comparison
+from src.helpers.config import load_raw_config
 from src.helpers.run_model import (
     run,
     neural_model_path,
@@ -87,11 +87,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file) or {}
-
-    raw = DEFAULT_CONFIG | config.get("inference", {})
+    raw = load_raw_config("inference", DEFAULT_CONFIG)
 
     # normalize types regardless of YAML formatting
     raw["nlat"] = int(raw["nlat"])
@@ -250,14 +246,22 @@ def run_rollout_pair(cfg):
     if cfg.ic == "galewsky":
         print("Initial conidtion is galewsky")
         phivrtdivspec_0 = galewsky_initial_condition(model=ref_solver)
+        # no spin-up needed (galewsky's IC is already the state to roll out from)
+        phivrtdivspec_0_spinned_up = phivrtdivspec_0
     elif cfg.ic == "real_world":
         print("Initial condition is real-world")
         netcdf_path = Path("reanalysis_data") / cfg.dataset_name / "data.nc"
         ds = xr.open_dataset(netcdf_path)
-        nlat_data, nlon_data = ds.sizes['latitude'], ds.sizes['longitude']
+        # a spectral (native spherical-harmonic) ERA5 dataset has a flat 'values'
+        # dim and no lat/lon, needing no vector transform - see
+        # rw_initial_condition's own auto-detection/docstring, mirrored here.
+        is_spectral = 'values' in ds.dims
+        vSHT = None
+        if not is_spectral:
+            nlat_data, nlon_data = ds.sizes['latitude'], ds.sizes['longitude']
+            vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data // 2, mmax=nlat_data // 2,
+                                grid='equiangular', csphase=False).to(ref_solver.device)
         ds.close()
-        vSHT = RealVectorSHT(nlat=nlat_data, nlon=nlon_data, lmax=nlat_data // 2, mmax=nlat_data // 2,
-                            grid='equiangular', csphase=False).to(ref_solver.device)
 
         start_load_time = time.perf_counter()
         era5_dataset = xr.open_dataset(netcdf_path).load()
@@ -298,7 +302,8 @@ def run_rollout_pair(cfg):
     #     run_model.py's _data_path_from_checkpoint) and skips straight to
     #     returning that path if a matching trajectory is already there.
     # ------------------------------------------------------------------ #
-    ic_time = (datetime.fromisoformat(cfg.ic_time) + timedelta(days=cfg.spinup_days)).isoformat()
+    ic_time = ((datetime.fromisoformat(cfg.ic_time) + timedelta(days=cfg.spinup_days)).isoformat()
+               if cfg.ic == "real_world" else None)
     neural_save_path = run(
         model_checkpoint=str(model_dir),
         initial_condition=phivrtdivspec_0_spinned_up.clone(),

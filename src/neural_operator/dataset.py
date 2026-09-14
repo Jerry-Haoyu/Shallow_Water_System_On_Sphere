@@ -109,13 +109,13 @@ class SWEDataset(torch.utils.data.Dataset):
 
         # step_window spans the whole trajectory: any start step whose n_future
         # target still lands inside the trajectory. Inferred from its length.
-        # Only sample after a 2-day warmup (skips the file's own spin-up/edge
+        # Only sample after a 0.5-day warmup (skips the file's own spin-up/edge
         # effects) - in units of this file's own frame cadence, so it's still
-        # "2 days" regardless of whether frames are 30 min apart (PS-solver
-        # output, warmup=96) or 60 min apart (ERA5-direct, warmup=48).
+        # "0.5 days" regardless of whether frames are 30 min apart (PS-solver
+        # output, warmup=24) or 60 min apart (ERA5-direct, warmup=12).
         n_frames = first["trajectory"].shape[0]
         print(f"💿 SWE Dataset: Each trajectory has n_frames={n_frames} ")
-        warmup_steps = max(1, round(2 * 24 * 60 / self.true_interval_minutes))
+        warmup_steps = max(1, round(0.5 * 24 * 60 / self.true_interval_minutes))
         self.step_window = (warmup_steps, n_frames - 1 - self.nfuture)
         if self.step_window[1] < self.step_window[0]:
             raise ValueError(

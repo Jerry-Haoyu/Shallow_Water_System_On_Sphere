@@ -28,11 +28,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import xarray as xr
-import yaml
 from torch_harmonics.sht import RealVectorSHT
 
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.numerical_solver.initial_condition import *
+from src.helpers.config import load_raw_config
 from src.helpers.run_model import (
     run,
     numerical_checkpoint_path,
@@ -77,11 +77,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file) or {}
-
-    raw = DEFAULT_CONFIG | config.get("run_solver", {})
+    raw = load_raw_config("run_solver", DEFAULT_CONFIG)
 
     # normalize types regardless of YAML formatting
     raw["lmax"] = int(raw["lmax"])

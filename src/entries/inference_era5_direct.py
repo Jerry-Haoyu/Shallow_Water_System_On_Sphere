@@ -30,9 +30,9 @@ sys.path.insert(0, str(SRC_DIR))
 from types import SimpleNamespace
 
 import torch
-import yaml
 
 from src.entries.inference import plot_per_step_loss, plot_sphere_comparison
+from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
 from src.helpers.run_model import load_model_info, neural_model_path, physical_to_nondim, run
 
@@ -58,10 +58,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f) or {}
-    raw = DEFAULT_CONFIG | config.get("inference_era5_direct", {})
+    raw = load_raw_config("inference_era5_direct", DEFAULT_CONFIG)
     return SimpleNamespace(**raw)
 
 

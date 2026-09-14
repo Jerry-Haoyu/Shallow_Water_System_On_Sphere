@@ -14,6 +14,8 @@ from src.neural_operator.sfno_model import SphericalFourierNeuralOperator as SFN
 from src.neural_operator.dataset import SWEDataset
 from src.neural_operator.loss import LOSS_FUNCTIONS
 from src.helpers.run_model import neural_model_path
+from src.helpers.config import load_raw_config
+from src.neural_operator.trainer_base import TrainerBase
 
 import csv
 import math
@@ -21,7 +23,6 @@ import os
 import time
 import json
 import warnings
-import yaml
 import re
 from types import SimpleNamespace 
 
@@ -33,12 +34,15 @@ import tqdm
 
 
 
-class SFNOSingleStepTrainer:
+class SFNOSingleStepTrainer(TrainerBase):
     # Roots of the neural-operator checkpoint / log trees. The per-run
     # directories underneath them are built from the model + training
     # configuration in _setup_run (see README.md for the convention).
     CHECKPOINT_ROOT = os.path.join("checkpoints", "neural_operator")
     LOG_ROOT = os.path.join("training_logs", "neural_operator")
+    # channel order matches SWEDataset's trajectory layout (frames, 3, lmax, mmax)
+    # and every loss function in loss.py (see their reduce_channels=False shape).
+    CHANNEL_NAMES = ("phi", "vorticity", "divergence")
 
     def __init__(self,
         training_data_dir,
@@ -109,9 +113,7 @@ class SFNOSingleStepTrainer:
         self.cache_in_memory = cache_in_memory
 
         # check if gpu is available here, if not, stop the training immediately
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if self.device.type == 'cpu':
-            raise RuntimeError("Device is now CPU !")
+        self._init_device()
 
         # Initialize the dataset
         self.ds = SWEDataset(simulation_data_dir=training_data_dir, n_future=n_future,
@@ -217,12 +219,22 @@ class SFNOSingleStepTrainer:
                 f"(recorded, current): {mismatches}")
         return info
 
+    def _history_columns(self):
+        """CSV header / in-memory history keys: aggregate + per-channel train
+        and validation loss, plus lr/gpu/epoch-time (logged but not plotted -
+        see _draw_dashboard)."""
+        cols = ["epoch", "train_loss", "validation_loss"]
+        cols += [f"train_loss_{name}" for name in self.CHANNEL_NAMES]
+        cols += [f"validation_loss_{name}" for name in self.CHANNEL_NAMES]
+        cols += ["lr", "gpu_utillization", "per_epoch_time"]
+        return cols
+
     def _load_history_from_csv(self):
         """Reconstruct in-memory history (for the dashboard) from an existing
         train_log.csv, so a resumed run's plot/log stay continuous instead of
         resetting at the resume point."""
-        history = {"epoch": [], "train_loss": [], "validation_loss": [],
-                   "lr": [], "gpu_utillization": [], "per_epoch_time": []}
+        columns = self._history_columns()
+        history = {col: [] for col in columns}
         if not os.path.isfile(self.log_file):
             return history
         with open(self.log_file, "r", newline="") as f:
@@ -231,6 +243,10 @@ class SFNOSingleStepTrainer:
                 history["train_loss"].append(float(row["train_loss"]))
                 history["validation_loss"].append(
                     float(row["validation_loss"]) if row["validation_loss"] else None)
+                for name in self.CHANNEL_NAMES:
+                    history[f"train_loss_{name}"].append(float(row[f"train_loss_{name}"]))
+                    val = row[f"validation_loss_{name}"]
+                    history[f"validation_loss_{name}"].append(float(val) if val else None)
                 history["lr"].append(float(row["lr"]))
                 history["gpu_utillization"].append(float(row["gpu_utillization"]))
                 history["per_epoch_time"].append(float(row["per_epoch_time"]))
@@ -243,6 +259,7 @@ class SFNOSingleStepTrainer:
                     weight_decay,
                     warmup_epochs,
                     warmup_start_factor,
+                    scheduler_type,
                     restart,
                     restart_period,
                     restart_mult,
@@ -367,7 +384,8 @@ class SFNOSingleStepTrainer:
                 f"weight_decay = {weight_decay}" ,
                 f"warmup_epochs = {warmup_epochs}" ,
                 f"warmup_start_factor = {warmup_start_factor}" ,
-                f"restart = {restart}",
+                f"scheduler_type = {scheduler_type} : cosine | constant, post-warmup LR schedule",
+                f"restart = {restart} (cosine only)",
                 f"restart_period = {restart_period}",
                 f"restart_mult = {restart_mult} ",
                 f"validation_cadence = {validation_cadence}",
@@ -412,6 +430,7 @@ class SFNOSingleStepTrainer:
             "weight_decay" : weight_decay ,
             "warmup_epochs" : warmup_epochs ,
             "warmup_start_factor" : warmup_start_factor ,
+            "scheduler_type" : scheduler_type ,
             "restart" : restart ,
             "restart_period" : restart_period,
             "restart_mult" : restart_mult,
@@ -429,30 +448,21 @@ class SFNOSingleStepTrainer:
             # CSV header (also the schema consumed by __update_log / the dashboard)
             with open(self.log_file, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(
-                    ["epoch", "train_loss", "validation_loss", "lr",
-                     "gpu_utillization", "per_epoch_time"]
-                )
-            self.history = {
-                "epoch": [], "train_loss": [], "validation_loss": [],
-                "lr": [], "gpu_utillization": [], "per_epoch_time": [],
-            }
+                writer.writerow(self._history_columns())
+            self.history = {col: [] for col in self._history_columns()}
         self.best_val_loss = math.inf
 
-    def _gpu_utilization(self):
-        try:
-            return float(torch.cuda.utilization(self.device))
-        except Exception:
-            # utilization() needs pynvml; fall back to memory footprint (MB).
-            return torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
-
-    def __update_log(self, epoch, train_loss, val_loss, lr, gpu_util,
-                     epoch_time, total_epochs, is_validation):
+    def __update_log(self, epoch, train_loss, val_loss, train_loss_channels,
+                     val_loss_channels, lr, gpu_util, epoch_time, total_epochs,
+                     is_validation):
         """Append one row to the CSV, print an ETA, and (on validation steps)
         redraw the dashboard plot."""
         self.history["epoch"].append(epoch)
         self.history["train_loss"].append(train_loss)
         self.history["validation_loss"].append(val_loss)  # None on non-val steps
+        for name, tl, vl in zip(self.CHANNEL_NAMES, train_loss_channels, val_loss_channels):
+            self.history[f"train_loss_{name}"].append(tl)
+            self.history[f"validation_loss_{name}"].append(vl)  # None on non-val steps
         self.history["lr"].append(lr)
         self.history["gpu_utillization"].append(gpu_util)
         self.history["per_epoch_time"].append(epoch_time)
@@ -462,6 +472,8 @@ class SFNOSingleStepTrainer:
             writer.writerow([
                 epoch, f"{train_loss:.6e}",
                 "" if val_loss is None else f"{val_loss:.6e}",
+                *[f"{tl:.6e}" for tl in train_loss_channels],
+                *["" if vl is None else f"{vl:.6e}" for vl in val_loss_channels],
                 f"{lr:.6e}", f"{gpu_util:.2f}", f"{epoch_time:.3f}",
             ])
 
@@ -480,34 +492,36 @@ class SFNOSingleStepTrainer:
         if is_validation:
             self._draw_dashboard()
 
-    def _draw_dashboard(self):
+    def _plot_loss_channel(self, ax, name):
+        """train + validation loss for one channel, on its own axes -
+        independent from the other channels (own y-scale/limits)."""
         h = self.history
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-
-        # train + validation loss on the same axes
-        ax = axes[0, 0]
-        ax.plot(h["epoch"], h["train_loss"], label="train", color="tab:blue")
-        val_epochs = [e for e, v in zip(h["epoch"], h["validation_loss"]) if v is not None]
-        val_losses = [v for v in h["validation_loss"] if v is not None]
+        train_key, val_key = f"train_loss_{name}", f"validation_loss_{name}"
+        ax.plot(h["epoch"], h[train_key], label="train", color="tab:blue")
+        val_epochs = [e for e, v in zip(h["epoch"], h[val_key]) if v is not None]
+        val_losses = [v for v in h[val_key] if v is not None]
         if val_losses:
             ax.plot(val_epochs, val_losses, label="validation",
                     color="tab:orange", marker="o")
-        ax.set_title("Loss")
+        ax.set_title(f"Loss ({name})")
         ax.set_xlabel("epoch")
-        ax.set_ylabel("spectral L2")
+        ax.set_ylabel(f"{self.loss_type} loss")
         ax.set_yscale("log")
         ax.legend()
 
-        axes[0, 1].plot(h["epoch"], h["lr"], color="tab:green")
-        axes[0, 1].set_title("Learning rate")
-        axes[0, 1].set_xlabel("epoch")
+    def _draw_dashboard(self):
+        h = self.history
+        # 3 independent per-channel loss panels + learning rate. gpu
+        # utilization / per-epoch time are still logged to train_log.csv but
+        # dropped from the plot (nothing to act on epoch-to-epoch from them).
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-        axes[1, 0].plot(h["epoch"], h["gpu_utillization"], color="tab:red")
-        axes[1, 0].set_title("GPU utilization")
-        axes[1, 0].set_xlabel("epoch")
+        self._plot_loss_channel(axes[0, 0], self.CHANNEL_NAMES[0])
+        self._plot_loss_channel(axes[0, 1], self.CHANNEL_NAMES[1])
+        self._plot_loss_channel(axes[1, 0], self.CHANNEL_NAMES[2])
 
-        axes[1, 1].plot(h["epoch"], h["per_epoch_time"], color="tab:purple")
-        axes[1, 1].set_title("Per-epoch time (s)")
+        axes[1, 1].plot(h["epoch"], h["lr"], color="tab:green")
+        axes[1, 1].set_title("Learning rate")
         axes[1, 1].set_xlabel("epoch")
 
         fig.suptitle(self.task_name)
@@ -516,16 +530,20 @@ class SFNOSingleStepTrainer:
         plt.close(fig)
 
     def _run_epoch(self, loader, train, optimizer=None):
-        """Run a single pass over ``loader``; returns the mean loss."""
+        """Run a single pass over ``loader``; returns (mean_loss, per_channel_loss),
+        the latter a len(CHANNEL_NAMES) list averaged the same way as mean_loss."""
         self.model.train(train)
         total_loss, n_batches = 0.0, 0
+        total_channel_loss = torch.zeros(len(self.CHANNEL_NAMES), device=self.device)
         torch.set_grad_enabled(train)
         for inp, tar, _ in loader:
             inp = inp.to(self.device)
             tar = tar.to(self.device)
 
             prd = self.model(inp)
-            loss = self.loss(self.solver, prd, tar, relative=True, squared=False)
+            channel_loss = self.loss(self.solver, prd, tar, relative=True,
+                                     squared=False, reduce_channels=False)
+            loss = channel_loss.mean()
 
             if train:
                 assert optimizer is not None, "optimizer required when train=True"
@@ -534,42 +552,11 @@ class SFNOSingleStepTrainer:
                 optimizer.step()
 
             total_loss += loss.item()
+            total_channel_loss += channel_loss.detach()
             n_batches += 1
         torch.set_grad_enabled(True)
-        return total_loss / max(n_batches, 1)
-
-    def _build_scheduler(self, optimizer, epochs, warmup_epochs,
-                         warmup_start_factor, restart, restart_period,
-                         restart_mult):
-        """LR schedule = optional linear warmup, then either a single cosine
-        decay or cosine annealing with warm restarts.
-
-        warmup_epochs        : linear ramp from warmup_start_factor*lr up to lr
-                               over this many epochs (0 disables warmup).
-        restart              : if True use CosineAnnealingWarmRestarts (periodic
-                               restarts) instead of a one-shot CosineAnnealingLR.
-        restart_period       : length (epochs) of the first restart cycle (T_0);
-                               defaults to the post-warmup span when unset.
-        restart_mult         : cycle-length growth factor after each restart (T_mult).
-        """
-        sched = torch.optim.lr_scheduler
-        # cosine runs over whatever epochs remain after the warmup ramp
-        remaining = max(epochs - warmup_epochs, 1)
-
-        if restart:
-            t0 = restart_period if restart_period is not None else remaining
-            main = sched.CosineAnnealingWarmRestarts(
-                optimizer, T_0=t0, T_mult=restart_mult)
-        else:
-            main = sched.CosineAnnealingLR(optimizer, T_max=remaining)
-
-        if warmup_epochs > 0:
-            warmup = sched.LinearLR(
-                optimizer, start_factor=warmup_start_factor, end_factor=1.0,
-                total_iters=warmup_epochs)
-            return sched.SequentialLR(
-                optimizer, schedulers=[warmup, main], milestones=[warmup_epochs])
-        return main
+        n_batches = max(n_batches, 1)
+        return total_loss / n_batches, (total_channel_loss / n_batches).tolist()
 
     def train(self,
         batch_size=128,
@@ -579,7 +566,8 @@ class SFNOSingleStepTrainer:
         validation_cadence=10,
         warmup_epochs=0,            # linear LR warmup length (0 = off)
         warmup_start_factor=0.01,   # warmup starts at this fraction of lr
-        restart=False,              # cosine annealing with warm restarts
+        scheduler_type='cosine',    # post-warmup LR schedule: 'cosine' | 'constant'
+        restart=False,              # cosine annealing with warm restarts (cosine only)
         restart_period=None,        # first restart cycle length T_0 (epochs)
         restart_mult=1,             # restart cycle growth factor T_mult
         compile=True,  # Whether to compile the model
@@ -596,6 +584,7 @@ class SFNOSingleStepTrainer:
                         weight_decay,
                         warmup_epochs,
                         warmup_start_factor,
+                        scheduler_type,
                         restart,
                         restart_period,
                         restart_mult,
@@ -623,6 +612,7 @@ class SFNOSingleStepTrainer:
                 f"weight_decay = {weight_decay}",
                 f"validation_cadence = {validation_cadence}",
                 f"warmup_epochs = {warmup_epochs} (start_factor {warmup_start_factor})",
+                f"scheduler_type = {scheduler_type}",
                 f"restart = {restart} (T_0={restart_period}, T_mult={restart_mult})",
                 f"compile = {compile}",
                 f"train / validation samples = {len(self.train_dataset)} / {len(self.test_dataset)}",
@@ -648,18 +638,11 @@ class SFNOSingleStepTrainer:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr,
                                      weight_decay=weight_decay)
         if resume_checkpoint is not None:
-            # Restores Adam's momentum/variance buffers, but also restores the
-            # OLD lr/weight_decay into param_groups - training config is allowed
-            # to differ on a continuation, so re-apply the current run's values
-            # rather than silently keeping whatever the matched run last used.
-            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-                pg["weight_decay"] = weight_decay
+            self._restore_optimizer_state(optimizer, resume_checkpoint, lr, weight_decay)
 
         scheduler = self._build_scheduler(
             optimizer, epochs, warmup_epochs, warmup_start_factor,
-            restart, restart_period, restart_mult)
+            scheduler_type, restart, restart_period, restart_mult)
         # Scheduler state isn't checkpointed; fast-forward it so a resumed run's
         # LR trajectory matches what a single 0..epochs run would have had at
         # this point, instead of restarting the schedule from epoch 0. This
@@ -680,15 +663,16 @@ class SFNOSingleStepTrainer:
         for ep in tqdm.tqdm(range(self.resume_from_epoch, epochs), desc="epochs",
                             initial=self.resume_from_epoch, total=epochs):
             epoch_start = time.perf_counter()
-            train_loss = self._run_epoch(train_loader, train=True, optimizer=optimizer)
+            train_loss, train_loss_channels = self._run_epoch(
+                train_loader, train=True, optimizer=optimizer)
 
             current_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
 
             is_validation = ((ep + 1) % validation_cadence == 0) or (ep == epochs - 1)
-            val_loss = None
+            val_loss, val_loss_channels = None, [None] * len(self.CHANNEL_NAMES)
             if is_validation:
-                val_loss = self._run_epoch(test_loader, train=False)
+                val_loss, val_loss_channels = self._run_epoch(test_loader, train=False)
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     # Save the underlying (uncompiled) module's state dict.
@@ -703,7 +687,8 @@ class SFNOSingleStepTrainer:
 
             epoch_time = time.perf_counter() - epoch_start
             gpu_util = self._gpu_utilization()
-            self.__update_log(ep, train_loss, val_loss, current_lr, gpu_util,
+            self.__update_log(ep, train_loss, val_loss, train_loss_channels,
+                              val_loss_channels, current_lr, gpu_util,
                               epoch_time, epochs, is_validation)
 
         total_time = time.perf_counter() - self.start_time
@@ -712,11 +697,6 @@ class SFNOSingleStepTrainer:
 
 
 def main():
-    # Accept config file from CLI arguments
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file)
-        
     DEFAULT_CONFIG = {
         "n_future" : 1,
         "num_layers" : 4,
@@ -769,6 +749,7 @@ def main():
         "validation_cadence" : 25,
         "warmup_epochs" : 5,
         "warmup_start_factor" : 0.01,
+        "scheduler_type" : "cosine",   # cosine | constant, post-warmup LR schedule
         "restart" : True,
         "restart_period" : 30,
         "restart_mult" : 2,
@@ -777,7 +758,7 @@ def main():
         "index" : None,       # 0/, 1/, ... slot to resume; required when continue=True
     }
 
-    raw_train_cfg = DEFAULT_CONFIG | config.get("train_single", {}) # config.get syntax : get(key, fallback)
+    raw_train_cfg = load_raw_config("train_single", DEFAULT_CONFIG)
 
     # Ensure types are correct regardless of YAML formatting
     raw_train_cfg["lr"] = float(raw_train_cfg["lr"])
@@ -828,6 +809,7 @@ def main():
         validation_cadence=train_config.validation_cadence,
         warmup_epochs=train_config.warmup_epochs,
         warmup_start_factor=train_config.warmup_start_factor,
+        scheduler_type=train_config.scheduler_type,
         restart=train_config.restart,
         restart_period=train_config.restart_period,
         restart_mult=train_config.restart_mult,

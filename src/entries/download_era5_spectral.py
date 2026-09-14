@@ -47,8 +47,8 @@ sys.path.insert(0, str(SRC_DIR))
 from types import SimpleNamespace
 
 import cdsapi
-import yaml
 
+from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
 
 
@@ -102,11 +102,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file) or {}
-
-    raw = DEFAULT_CONFIG | config.get("download_era5_spectral", {})
+    raw = load_raw_config("download_era5_spectral", DEFAULT_CONFIG)
     cfg = SimpleNamespace(**raw)
 
     if not cfg.dataset_name:

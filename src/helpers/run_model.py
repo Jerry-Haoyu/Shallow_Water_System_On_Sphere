@@ -30,8 +30,8 @@ from src.helpers.print import print_in_box, finish_simulation_log
 # non-dimensionally internally - these helpers compute the (T, U) needed for
 # that final conversion, and convert a spectral state with them.
 # --------------------------------------------------------------------------- #
-EARTH_RADIUS = 6.37122e6    # m, mirrors AbstractSWSolver's default
-EARTH_GRAVITY = 9.80616     # m/s^2, mirrors AbstractSWSolver's default
+EARTH_RADIUS = 6.37122e6    # m, mirrors ShallowWaterSolver's default
+EARTH_GRAVITY = 9.80616     # m/s^2, mirrors ShallowWaterSolver's default
 DEFAULT_HAVG = 10.0e3       # m, reference height for runs with no dataset (e.g. galewsky)
 
 

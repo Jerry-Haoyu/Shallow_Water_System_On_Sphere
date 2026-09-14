@@ -13,6 +13,8 @@ from src.neural_operator.sfno_model import SphericalFourierNeuralOperator as SFN
 from src.neural_operator.dataset import SWEMultiStepDataset
 from src.neural_operator.loss import LOSS_FUNCTIONS
 from src.helpers.run_model import neural_model_path
+from src.helpers.config import load_raw_config
+from src.neural_operator.trainer_base import TrainerBase
 
 import csv
 import json
@@ -21,7 +23,6 @@ import os
 import random
 import time
 import warnings
-import yaml
 import re
 from types import SimpleNamespace
 
@@ -31,7 +32,7 @@ import matplotlib.pyplot as plt
 import tqdm
 
 
-class SFNOMultiStepTrainer:
+class SFNOMultiStepTrainer(TrainerBase):
     """Teacher/student curriculum fine-tuning on top of an already-trained
     single-step SFNO (see multi_step_curriculum_training.png):
 
@@ -117,9 +118,7 @@ class SFNOMultiStepTrainer:
                 f"{self.max_subsequent_steps} - there would be no curriculum stage to run."
             )
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if self.device.type == 'cpu':
-            raise RuntimeError("Device is now CPU !")
+        self._init_device()
 
         # ------------------------------------------------------------------ #
         # Locate the pretrained single-step run this curriculum builds on -
@@ -408,12 +407,6 @@ class SFNOMultiStepTrainer:
         1 .. max_subsequent_steps (see class docstring)."""
         return min(epoch // epochs_per_stage + self.min_curr_step, self.max_subsequent_steps)
 
-    def _gpu_utilization(self):
-        try:
-            return float(torch.cuda.utilization(self.device))
-        except Exception:
-            return torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
-
     def __update_log(self, epoch, curr_step, train_loss, val_loss, lr, gpu_util,
                      epoch_time, total_epochs, is_validation):
         self.history["epoch"].append(epoch)
@@ -551,27 +544,6 @@ class SFNOMultiStepTrainer:
         torch.set_grad_enabled(True)
         return total_loss / max(n_batches, 1)
 
-    def _build_scheduler(self, optimizer, epochs, warmup_epochs,
-                         warmup_start_factor, restart, restart_period,
-                         restart_mult):
-        sched = torch.optim.lr_scheduler
-        remaining = max(epochs - warmup_epochs, 1)
-
-        if restart:
-            t0 = restart_period if restart_period is not None else remaining
-            main = sched.CosineAnnealingWarmRestarts(
-                optimizer, T_0=t0, T_mult=restart_mult)
-        else:
-            main = sched.ConstantLR(optimizer, factor=1.0, total_iters=remaining)
-
-        if warmup_epochs > 0:
-            warmup = sched.LinearLR(
-                optimizer, start_factor=warmup_start_factor, end_factor=1.0,
-                total_iters=warmup_epochs)
-            return sched.SequentialLR(
-                optimizer, schedulers=[warmup, main], milestones=[warmup_epochs])
-        return main
-
     def train(self,
         epochs_per_stage=20,
         batch_size=16,
@@ -638,14 +610,16 @@ class SFNOMultiStepTrainer:
         optimizer = torch.optim.AdamW(self.student.parameters(), lr=lr,
                                      weight_decay=weight_decay)
         if resume_checkpoint is not None:
-            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-                pg["weight_decay"] = weight_decay
+            self._restore_optimizer_state(optimizer, resume_checkpoint, lr, weight_decay)
 
+        # This trainer has no independent "scheduler_type" knob of its own -
+        # it only ever chose between warm restarts and a flat LR, which
+        # TrainerBase._build_scheduler's 'cosine'+restart and 'constant'
+        # branches reproduce exactly.
+        scheduler_type = "cosine" if restart else "constant"
         scheduler = self._build_scheduler(
             optimizer, self.total_epochs, warmup_epochs, warmup_start_factor,
-            restart, restart_period, restart_mult)
+            scheduler_type, restart, restart_period, restart_mult)
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message=".*lr_scheduler.step\\(\\) before `optimizer.step\\(\\)`.*")
@@ -710,10 +684,6 @@ class SFNOMultiStepTrainer:
 
 
 def main():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yml"
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file)
-
     DEFAULT_CONFIG = {
         # identifies the pretrained single-step run to build on (same
         # convention as the `inference` config section)
@@ -764,7 +734,7 @@ def main():
         "continue": True,
     }
 
-    raw_train_cfg = DEFAULT_CONFIG | config.get("train_multi", {})
+    raw_train_cfg = load_raw_config("train_multi", DEFAULT_CONFIG)
 
     raw_train_cfg["nlat"] = int(raw_train_cfg["nlat"])
     raw_train_cfg["nlon"] = int(raw_train_cfg["nlon"])

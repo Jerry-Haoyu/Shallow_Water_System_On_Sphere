@@ -14,10 +14,8 @@ import time
 
 from src.helpers.print import print_in_box, finish_simulation_log
 
-from src.numerical_solver.solver import AbstractSWSolver
 
-
-class ShallowWaterSolver(AbstractSWSolver):
+class ShallowWaterSolver(nn.Module):
     """
     SWE solver class. Interface inspired bu pyspharm and SHTns
     Note: 
@@ -42,7 +40,7 @@ class ShallowWaterSolver(AbstractSWSolver):
         #                 removed (Orszag's 3/2 rule; see dudtspec).
         # h_avg, h_amp  : dataset-wide reference height / height-amplitude (meters, from
         #                 e.g. reanalysis_data/<name>/h_stats.npz); fall back to the
-        #                 AbstractSWSolver defaults (10km / 120m) when not given.
+        #                 defaults above (10km / 120m) when not given.
         # non_dimensional : rescale radius/gravity/havg/hamp/omega/umax by the length
         #                 scale L=radius, velocity scale U=sqrt(g*havg) and time scale
         #                 T=L/U before anything else is derived from them. The SWE
@@ -69,6 +67,18 @@ class ShallowWaterSolver(AbstractSWSolver):
         self.start_time = time.perf_counter()
         print("Initializing the psuedo-spectral solver")
         super().__init__()
+
+        # Note this does not move the model actually to device,
+        # which should be done outside after instantiation
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # physical constants
+        self.register_buffer('radius', torch.as_tensor(6.37122E6, dtype=torch.float64))
+        self.register_buffer('omega', torch.as_tensor(7.292E-5, dtype=torch.float64))
+        self.register_buffer('gravity', torch.as_tensor(9.80616, dtype=torch.float64))
+        self.register_buffer('havg', torch.as_tensor(10.e3, dtype=torch.float64))
+        self.register_buffer('hamp', torch.as_tensor(120, dtype=torch.float64))
+
         self.solver_type='psuedo_spectral_naive'
         self.cfl = cfl
         self.semi_implicit = semi_implicit
