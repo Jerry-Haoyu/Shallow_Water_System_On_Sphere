@@ -400,6 +400,62 @@ def visualize_initial_condition_on_sphere(
     print(f"Saved initial-condition sphere plot -> {output_path}")
 
 
+# fixed categorical order (dataviz skill): slot 1/2/3 hold up all-pairs CVD checks
+_DIAG_COLORS = {"geopotential": "#2a78d6", "vorticity": "#eb6834", "divergence": "#1baf7a"}
+
+
+def plot_trajectory_diagnostics(save_path, output_dir):
+    """Line plot of the spatial average (mean +/- amplitude band) of geopotential,
+    vorticity and divergence across a saved trajectory.
+
+    Both the mean and the amplitude (RMS deviation around the mean) are read
+    directly off each frame's Y_0^0 / degree-l spherical-harmonic coefficients
+    (orthonormal real SHT: l=0,m=0 is the domain mean up to sqrt(4*pi), and
+    Parseval's theorem gives the mean-square from the coefficient magnitudes),
+    not by reconstructing the grid and integrating - same technique as
+    src/analyze/statistics.py's compute_h_stats_ic.
+    """
+    data = torch.load(save_path, weights_only=False)
+    trajectory = data["trajectory"]  # (N, 3, lmax, mmax) complex: phi, vrt, div
+    true_interval_minutes = data["metadata"]["true_interval_minutes"]
+
+    sqrt_4pi = float(4.0 * np.pi) ** 0.5
+    n_frames = trajectory.shape[0]
+    hours = np.arange(n_frames) * true_interval_minutes / 60.0
+
+    fig, ax = plt.subplots(3, figsize=(8, 4.5))
+    for i, name in enumerate(["geopotential", "vorticity", "divergence"]):
+        coeff = trajectory[:, i]  # (N, lmax, mmax) complex
+        mean = coeff[:, 0, 0].real / sqrt_4pi
+        meansq = (coeff[:, :, 0].abs() ** 2).sum(dim=-1) + 2.0 * (coeff[:, :, 1:].abs() ** 2).sum(dim=(-2, -1))
+        meansq = meansq / (4.0 * np.pi)
+        amp = torch.sqrt((meansq - mean ** 2).clamp_min(0))
+
+        mean_np, amp_np = mean.numpy(), amp.numpy()
+        color = _DIAG_COLORS[name]
+        ax[i].plot(hours, mean_np, label=name, color=color, linewidth=2)
+        ax[i].fill_between(hours, mean_np - amp_np, mean_np + amp_np, color=color, alpha=0.15, linewidth=0)
+        ax[i].set_title(f"Trajectory diagnostics: {name}")
+
+        ax2 = ax[i].secondary_yaxis('right')
+        ax2.set_ylabel('Change(%)')
+        ax[i].plot(hours, np.abs(mean_np - mean_np[0])/mean_np[0], color=color, linestyle='dashed', label=r'$\frac{\mu_{t}-\mu_0}{\mu_0}$')
+        ax[i].axhline(0, color="#c3c2b7", linewidth=1, zorder=0)
+        ax[i].grid(True, color="#e1e0d9", linewidth=0.8)
+        ax[i].legend(frameon=False, loc='upper right')
+
+    fig.supxlabel('Time (hours)')
+    fig.supylabel('Diagnostic Distribution (μ±σ)')
+
+    fig.tight_layout()
+
+    out_path = Path(output_dir) / f"{Path(save_path).stem}_diagnostics.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"📈 Saved trajectory diagnostics plot -> {out_path}")
+    return out_path
+
+
 def plot_sphere_comparison(ref_data, inf_data, var, hours, output_path,
                            ref_label="Ground Truth", inf_label="Inference",
                            elev=15, azim=35, figsize=None):

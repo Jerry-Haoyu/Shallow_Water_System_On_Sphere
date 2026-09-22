@@ -24,14 +24,12 @@ from types import SimpleNamespace
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
 import xarray as xr
 from torch_harmonics.sht import RealVectorSHT
 
 from src.numerical_solver.psuedo_spectral_solver_naive import ShallowWaterSolver
 from src.numerical_solver.initial_condition import *
+from src.analyze.visualization import plot_trajectory_diagnostics
 from src.helpers.config import load_raw_config
 from src.helpers.run_model import (
     run,
@@ -62,6 +60,20 @@ DEFAULT_CONFIG = {
     "ic_data_path": None,           # optional (real_world): pre-sliced NetCDF (see batch_simulation.py)
                                      # to open instead of the full dataset_name/data.nc
     "pressure": None,               # for naming (real_world), e.g. 500
+    # galewsky ic only - overrides for galewsky_initial_condition's own defaults
+    # (see initial_condition.py), e.g. for sweeping jet placement/strength/
+    # perturbation across many jobs (see batch_simulation.py's galewsky mode)
+    # rather than always the one canned test case.
+    "galewsky_umax": 80.,
+    "galewsky_usouth": 1 / 7,
+    "galewsky_unorth": 5 / 14,
+    "galewsky_perturb_loc": 0.25,
+    "galewsky_perturb_amp": 1.,
+    "galewsky_noise_level": 1,
+    # galewsky ic only - distinguishes this run's output filename from another
+    # galewsky run off the same checkpoint (see run_model.run()'s variant_tag);
+    # galewsky otherwise has no ic_time of its own to make the filename unique.
+    "variant_tag": None,
     # exponential spectral filter applied by rw_initial_condition in place of a hard
     # truncation when bringing real-world data down to lmax: sigma=exp(-a*(l/lmax))^p
     "a": 2,
@@ -90,6 +102,12 @@ def load_config():
     raw["rad_smooth_fraction"] = float(raw["rad_smooth_fraction"])
     raw["a"] = float(raw["a"])
     raw["p"] = float(raw["p"])
+    raw["galewsky_umax"] = float(raw["galewsky_umax"])
+    raw["galewsky_usouth"] = float(raw["galewsky_usouth"])
+    raw["galewsky_unorth"] = float(raw["galewsky_unorth"])
+    raw["galewsky_perturb_loc"] = float(raw["galewsky_perturb_loc"])
+    raw["galewsky_perturb_amp"] = float(raw["galewsky_perturb_amp"])
+    raw["galewsky_noise_level"] = float(raw["galewsky_noise_level"])
 
     cfg = SimpleNamespace(**raw)
 
@@ -106,62 +124,6 @@ def load_config():
         if cfg.tau_rad is None:
             raise ValueError("run_solver.tau_rad is required when rad=True.")
     return cfg
-
-
-# fixed categorical order (dataviz skill): slot 1/2/3 hold up all-pairs CVD checks
-_DIAG_COLORS = {"geopotential": "#2a78d6", "vorticity": "#eb6834", "divergence": "#1baf7a"}
-
-
-def plot_trajectory_diagnostics(save_path, output_dir):
-    """Line plot of the spatial average (mean +/- amplitude band) of geopotential,
-    vorticity and divergence across a saved trajectory.
-
-    Both the mean and the amplitude (RMS deviation around the mean) are read
-    directly off each frame's Y_0^0 / degree-l spherical-harmonic coefficients
-    (orthonormal real SHT: l=0,m=0 is the domain mean up to sqrt(4*pi), and
-    Parseval's theorem gives the mean-square from the coefficient magnitudes),
-    not by reconstructing the grid and integrating - same technique as
-    src/analyze/statistics.py's compute_h_stats_ic.
-    """
-    data = torch.load(save_path, weights_only=False)
-    trajectory = data["trajectory"]  # (N, 3, lmax, mmax) complex: phi, vrt, div
-    true_interval_minutes = data["metadata"]["true_interval_minutes"]
-
-    sqrt_4pi = float(4.0 * np.pi) ** 0.5
-    n_frames = trajectory.shape[0]
-    hours = np.arange(n_frames) * true_interval_minutes / 60.0
-
-    fig, ax = plt.subplots(3, figsize=(8, 4.5))
-    for i, name in enumerate(["geopotential", "vorticity", "divergence"]):
-        coeff = trajectory[:, i]  # (N, lmax, mmax) complex
-        mean = coeff[:, 0, 0].real / sqrt_4pi
-        meansq = (coeff[:, :, 0].abs() ** 2).sum(dim=-1) + 2.0 * (coeff[:, :, 1:].abs() ** 2).sum(dim=(-2, -1))
-        meansq = meansq / (4.0 * np.pi)
-        amp = torch.sqrt((meansq - mean ** 2).clamp_min(0))
-
-        mean_np, amp_np = mean.numpy(), amp.numpy()
-        color = _DIAG_COLORS[name]
-        ax[i].plot(hours, mean_np, label=name, color=color, linewidth=2)
-        ax[i].fill_between(hours, mean_np - amp_np, mean_np + amp_np, color=color, alpha=0.15, linewidth=0)
-        ax[i].set_title(f"Trajectory diagnostics: {name}")
-
-        ax2 = ax[i].secondary_yaxis('right')
-        ax2.set_ylabel('Change(%)')
-        ax[i].plot(hours, np.abs(mean_np - mean_np[0])/mean_np[0], color=color, linestyle='dashed', label=r'$\frac{\mu_{t}-\mu_0}{\mu_0}$')
-        ax[i].axhline(0, color="#c3c2b7", linewidth=1, zorder=0)
-        ax[i].grid(True, color="#e1e0d9", linewidth=0.8)
-        ax[i].legend(frameon=False, loc='upper right')
-        
-    fig.supxlabel('Time (hours)')
-    fig.supylabel('Diagnostic Distribution (μ±σ)')
-
-    fig.tight_layout()
-
-    out_path = Path(output_dir) / f"{Path(save_path).stem}_diagnostics.png"
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"📈 Saved trajectory diagnostics plot -> {out_path}")
-    return out_path
 
 
 def main():
@@ -233,7 +195,15 @@ def main():
     # reconstructs its own solver from ckpt_dir internally - see run_model.run().
     phi_eq_spec = None
     if cfg.ic == "galewsky":
-        phivrtdivspec_0 = galewsky_initial_condition(model=solver)
+        phivrtdivspec_0 = galewsky_initial_condition(
+            model=solver,
+            umax=cfg.galewsky_umax,
+            usouth=cfg.galewsky_usouth,
+            unorth=cfg.galewsky_unorth,
+            perturb_loc=cfg.galewsky_perturb_loc,
+            perturb_amp=cfg.galewsky_perturb_amp,
+            noise_level=cfg.galewsky_noise_level,
+        )
     elif cfg.ic == "real_world":
         # a pre-sliced per-job file (see batch_simulation.py) avoids opening
         # the full (potentially large, multi-year) ERA5 dataset in every job.
@@ -288,6 +258,7 @@ def main():
         phi_eq_spec=phi_eq_spec,
         filter_a=cfg.a if cfg.ic == "real_world" else None,
         filter_p=cfg.p if cfg.ic == "real_world" else None,
+        variant_tag=cfg.variant_tag if cfg.ic == "galewsky" else None,
     )
 
     plot_trajectory_diagnostics(save_path, Path(save_path).parent)

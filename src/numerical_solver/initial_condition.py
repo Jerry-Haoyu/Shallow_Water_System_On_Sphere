@@ -31,17 +31,29 @@ def _solve_balance_geopotential(model, uv_grid, height_field):
 
 # the function has been modified to accept more parameters for generating diverse initial conditions
 def galewsky_initial_condition(model,
-                                umax = 80., 
-                               usouth = 1/7, 
-                               unorth = 5/14, 
-                               perturb_loc=0.25, 
-                               perturb_amp=1., 
+                                umax = 80.,
+                               usouth = 1/7,
+                               unorth = 5/14,
+                               perturb_loc=0.25,
+                               perturb_amp=1.,
                                noise_level=1):
     """
     Initializes non-linear barotropically unstable shallow water test case of Galewsky et al. (2004, Tellus, 56A, 429-440).
 
     [1] Galewsky; An initial-value problem for testing numerical models of the global shallow-water equations;
         DOI: 10.1111/j.1600-0870.2004.00071.x; http://www-vortex.mcs.st-and.ac.uk/~rks/reprints/galewsky_etal_tellus_2004.pdf
+
+    umax/noise_level are physical constants (m/s, m), the same literal values
+    Galewsky et al. (2004) quote for their own ~10 km/313 m/s reference case.
+    Rather than rescaling them to reproduce that exact Froude number/fractional
+    perturbation for every `model`, they're taken as reasonable literal jet-
+    strength/perturbation numbers and non-dimensionalized using `model`'s OWN
+    (U, havg_phys) directly (e.g. a checkpoint's own recorded h_avg/h_amp, see
+    src/entries/inference.py's run_rollout_pair) - so a shallower/deeper model
+    gets a correspondingly weaker/stronger Froude number rather than always
+    the literal Galewsky-2004 ratio. This still produces a zonally-symmetric,
+    barotropically unstable jet; it does not aim to reproduce Galewsky et
+    al.'s test case exactly.
     """
     device = model.lap.device
 

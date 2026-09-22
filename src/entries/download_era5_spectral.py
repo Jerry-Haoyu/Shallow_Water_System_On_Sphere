@@ -27,6 +27,15 @@ Layout (mirrors the reanalysis_data/<dataset_name>/ convention):
     reanalysis_data/<dataset_name>/chunks/<label>.grib   per-chunk GRIB
     reanalysis_data/<dataset_name>/manifest.json         resume state
     reanalysis_data/<dataset_name>/data.grib             merged chunks
+    reanalysis_data/<dataset_name>/data.nc               merged chunks, as netCDF
+    reanalysis_data/<dataset_name>/h_stats.npz           per-time h_avg/h_amp
+    reanalysis_data/<dataset_name>/h_stats_plot.png      (both from src/analyze/statistics.py)
+
+The last three are produced in the same run right after merging, mirroring
+download_era5.py's data.nc/h_stats.npz/h_stats_plot.png outputs - so this
+dataset is immediately usable as an evaluation dataset (e.g. by
+src/entries/inference.py) without a separate manual GRIB->netCDF conversion
+step.
 
 Configuration is read from the ``download_era5_spectral`` section of
 config.yml (pass an alternative path as the first CLI argument).
@@ -47,9 +56,11 @@ sys.path.insert(0, str(SRC_DIR))
 from types import SimpleNamespace
 
 import cdsapi
+import xarray as xr
 
 from src.helpers.config import load_raw_config
 from src.helpers.print import print_in_box
+from src.analyze.statistics import plot_h_stats_ic
 
 
 # Native spherical-harmonic pressure-level parameters in ERA5-complete (MARS
@@ -346,12 +357,58 @@ def merge_chunks(dataset_dir, manifest):
     return merged_path
 
 
+def convert_grib_to_netcdf(grib_path, netcdf_path):
+    """Materialize the merged GRIB (native spherical-harmonic vo/d/z
+    coefficients, per-message flat 'values' arrays) as a proper netCDF file via
+    cfgrib - mirroring download_era5.py's data.nc so downstream consumers
+    (rw_initial_condition, statistics.compute_h_stats_ic) can open this
+    dataset the same generic way (plain ``xr.open_dataset(path)``) regardless
+    of whether it came from a gridded or spectral ERA5 retrieval.
+    """
+    ds = xr.open_dataset(grib_path, engine="cfgrib").load()
+    ds.to_netcdf(netcdf_path)
+    ds.close()
+
+
+FINAL_OUTPUTS = ("data.nc", "h_stats.npz", "h_stats_plot.png")
+
+
+def dataset_finished(dataset_dir):
+    """Whether every file this whole pipeline is meant to produce (see this
+    module's docstring) is already on disk - the idempotency check `main()`
+    runs FIRST, before even touching cdsapi.Client() (which a from-scratch,
+    already-finished re-run has no other reason to need), so a completed
+    dataset re-run is a pure no-op regardless of network/credentials.
+    """
+    return all((dataset_dir / name).is_file() for name in FINAL_OUTPUTS)
+
+
 def main():
     cfg = load_config()
+
+    dataset_dir = Path("reanalysis_data") / cfg.dataset_name
+
+    # ------------------------------------------------------------------ #
+    # Idempotency fast path: if a previous run already produced everything
+    # this pipeline is responsible for, stop here and say so - no chunk
+    # download bookkeeping, no CDS API client, no re-merge, no h_stats
+    # recompute. `overwrite: True` bypasses this (and the finer-grained
+    # data.nc / h_stats guards further below) to force a full redo.
+    # ------------------------------------------------------------------ #
+    if not cfg.overwrite and dataset_finished(dataset_dir):
+        print_in_box({
+            "title": "Download ERA5-complete Raw Spectral Dataset",
+            "lines": [
+                f"dataset_name = {cfg.dataset_name}",
+                f"✅ job already finished: {', '.join(FINAL_OUTPUTS)} all present under {dataset_dir}",
+                "Nothing to do (set download_era5_spectral.overwrite: True to force a redo).",
+            ],
+        })
+        return
+
     hours = resolve_hours(cfg)
     param_codes = [VARIABLE_PARAM_CODES[v] for v in cfg.variables]
 
-    dataset_dir = Path("reanalysis_data") / cfg.dataset_name
     chunks_dir = dataset_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = dataset_dir / "manifest.json"
@@ -456,6 +513,25 @@ def main():
         merged_path = merge_chunks(dataset_dir, manifest)
         if merged_path:
             print(f"Finished merging chunks -> {merged_path}")
+
+            # ---------------------------------------------------------- #
+            # data.nc + h_stats.npz + h_stats_plot.png, all in this same
+            # invocation - see convert_grib_to_netcdf and
+            # src/analyze/statistics.py's plot_h_stats_ic.
+            # ---------------------------------------------------------- #
+            netcdf_path = dataset_dir / "data.nc"
+            if netcdf_path.is_file() and not cfg.overwrite:
+                print(f"✅ {netcdf_path} already exists; skipping GRIB->netCDF conversion.")
+            else:
+                convert_grib_to_netcdf(merged_path, netcdf_path)
+                print(f"Converted merged GRIB -> {netcdf_path}")
+
+            h_stats_path = dataset_dir / "h_stats.npz"
+            h_stats_plot_path = dataset_dir / "h_stats_plot.png"
+            if not cfg.overwrite and h_stats_path.is_file() and h_stats_plot_path.is_file():
+                print(f"✅ {h_stats_path} and {h_stats_plot_path} already exist; skipping h_stats computation.")
+            else:
+                plot_h_stats_ic(cfg.dataset_name)
 
 
 if __name__ == "__main__":

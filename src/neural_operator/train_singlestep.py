@@ -285,7 +285,17 @@ class SFNOSingleStepTrainer(TrainerBase):
         # integer sub-directory (0/, 1/, 2/, ...) and is documented in
         # model_info.json. The log tree mirrors the checkpoint tree under LOG_ROOT.
         # ------------------------------------------------------------------ #
-        self.train_data_tag = re.findall(r"dataset_(\w+)",self.training_data_dir)[0]
+        # a real_world numerical checkpoint's training data carries its own
+        # dataset_<name> leaf (see numerical_checkpoint_path); a galewsky-only
+        # one has no dataset of its own (no such node - see
+        # _data_path_from_checkpoint), so fall back to its ic_<name> node
+        # instead (e.g. "galewsky") as the trainData tag.
+        dataset_match = re.findall(r"dataset_(\w+)", self.training_data_dir)
+        if dataset_match:
+            self.train_data_tag = dataset_match[0]
+        else:
+            ic_match = re.findall(r"ic_(\w+)", self.training_data_dir)
+            self.train_data_tag = ic_match[0] if ic_match else "unknown"
         model_path_kwargs = dict(
             resol=(self.nlat, self.nlon),
             n_future=self.n_future,
@@ -389,6 +399,7 @@ class SFNOSingleStepTrainer(TrainerBase):
                 f"restart_period = {restart_period}",
                 f"restart_mult = {restart_mult} ",
                 f"validation_cadence = {validation_cadence}",
+                f"no_height_loss = {self.no_height_loss} : phi excluded from the backpropagated/best-checkpoint loss",
             ]
         }
 
@@ -435,6 +446,7 @@ class SFNOSingleStepTrainer(TrainerBase):
             "restart_period" : restart_period,
             "restart_mult" : restart_mult,
             "validation_cadence" : validation_cadence,
+            "no_height_loss" : self.no_height_loss,
         }
 
         with open(self.info_file, 'w', encoding='utf-8') as f:
@@ -531,7 +543,13 @@ class SFNOSingleStepTrainer(TrainerBase):
 
     def _run_epoch(self, loader, train, optimizer=None):
         """Run a single pass over ``loader``; returns (mean_loss, per_channel_loss),
-        the latter a len(CHANNEL_NAMES) list averaged the same way as mean_loss."""
+        the latter a len(CHANNEL_NAMES) list averaged the same way as mean_loss.
+
+        per_channel_loss always covers every channel (phi included) so the
+        dashboard/CSV keep showing phi's error even when no_height_loss drops
+        it from the scalar `mean_loss` that's actually backpropagated /
+        used for best-checkpoint selection.
+        """
         self.model.train(train)
         total_loss, n_batches = 0.0, 0
         total_channel_loss = torch.zeros(len(self.CHANNEL_NAMES), device=self.device)
@@ -543,7 +561,10 @@ class SFNOSingleStepTrainer(TrainerBase):
             prd = self.model(inp)
             channel_loss = self.loss(self.solver, prd, tar, relative=True,
                                      squared=False, reduce_channels=False)
-            loss = channel_loss.mean()
+            # CHANNEL_NAMES[0] == "phi" (height) - excluded here rather than
+            # in loss.py, since loss.py's reduce_channels=False output is
+            # already the per-channel breakdown this just selects from.
+            loss = channel_loss[1:].mean() if self.no_height_loss else channel_loss.mean()
 
             if train:
                 assert optimizer is not None, "optimizer required when train=True"
@@ -573,10 +594,18 @@ class SFNOSingleStepTrainer(TrainerBase):
         compile=True,  # Whether to compile the model
         continue_training=False,    # resume the run at continue_index instead of starting fresh
         continue_index=None,        # 0/, 1/, ... slot to resume; required when continue_training=True
+        no_height_loss=False,       # drop phi (height) from the scalar loss - see _run_epoch
         ):
 
         if continue_training and continue_index is None:
             raise ValueError("continue_training=True requires continue_index to be set.")
+
+        # An optimization-stage knob, not an architecture one (like lr/epochs
+        # below) - deliberately excluded from _architecture_signature so a
+        # continued run can flip it on mid-training (e.g. once phi has
+        # converged, concentrate signal on vorticity/divergence) without
+        # needing a fresh checkpoint index.
+        self.no_height_loss = no_height_loss
 
         self._setup_run(epochs,
                         lr,
@@ -615,6 +644,7 @@ class SFNOSingleStepTrainer(TrainerBase):
                 f"scheduler_type = {scheduler_type}",
                 f"restart = {restart} (T_0={restart_period}, T_mult={restart_mult})",
                 f"compile = {compile}",
+                f"no_height_loss = {no_height_loss}",
                 f"train / validation samples = {len(self.train_dataset)} / {len(self.test_dataset)}",
             ],
         }
@@ -756,6 +786,12 @@ def main():
         "compile" : False,
         "continue" : False,   # resume the run at "index" instead of starting fresh
         "index" : None,       # 0/, 1/, ... slot to resume; required when continue=True
+        # drop phi (height) from the scalar loss that's backpropagated / used
+        # for best-checkpoint selection - phi's per-channel loss is still
+        # logged/plotted regardless. Meant for later-stage fine-tuning (via
+        # continue=True) once phi has converged and vorticity/divergence
+        # need more of the training signal.
+        "no_height_loss" : False,
     }
 
     raw_train_cfg = load_raw_config("train_single", DEFAULT_CONFIG)
@@ -816,6 +852,7 @@ def main():
         compile=train_config.compile,
         continue_training=continue_training,
         continue_index=continue_index,
+        no_height_loss=bool(train_config.no_height_loss),
     )
 
 

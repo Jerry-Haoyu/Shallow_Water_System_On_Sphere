@@ -382,10 +382,22 @@ def is_neural_checkpoint(model_checkpoint):
 
 def _data_path_from_checkpoint(model_checkpoint, duration, ic,
                                pressure=None, ic_time=None, dataset_name=None,
-                               single_step=True, filter_a=None, filter_p=None):
+                               single_step=True, filter_a=None, filter_p=None,
+                               spinup_days=None, variant_tag=None):
     """(directory, file_name) of a run's trajectory output, derived entirely
     from `model_checkpoint`'s own path plus the data-specific info a single
     checkpoint doesn't pin down (duration, ic, ...).
+
+    variant_tag: galewsky only - galewsky has no ic_time of its own to
+        distinguish one run from another (unlike real_world, whose ic_time
+        already makes every run's filename unique), so generating MANY
+        distinct galewsky trajectories from the same checkpoint (e.g.
+        batch_simulation.py's galewsky mode, sweeping umax/jet placement/etc.
+        for a training SET rather than one canned test case) would otherwise
+        have every job collide on the same "model_output.pt" - only the first
+        job to finish would actually get saved, and run()'s cache check would
+        silently skip every other job as "already exists". Pass a unique
+        string per job (e.g. "galewsky_0007") to give each its own file.
 
     filter_a, filter_p: the exponential spectral filter parameters
         rw_initial_condition applied when generating this trajectory's initial
@@ -399,6 +411,18 @@ def _data_path_from_checkpoint(model_checkpoint, duration, ic,
         different initial condition and must not collide with (or be silently
         skipped in favor of) another run's cached trajectory at the same
         ic_time, hence still tagging *something* in the path.
+
+    spinup_days: how many days the caller integrated `initial_condition`
+        forward before calling run() (see inference.py's run_rollout_pair) -
+        galewsky only. real_world already bakes its spin-up into the
+        ic_time it passes in (shifted forward by spinup_days before reaching
+        here), so a different spinup_days there naturally lands on a
+        different `_date_tag(ic_time)` filename with no extra tagging needed.
+        galewsky has no ic_time of its own to shift, so without this its
+        filename ("model_output.pt") would stay identical across different
+        spinup_days values, and run()'s cache check below would silently
+        replay a stale trajectory spun up under a different (or zero)
+        spinup_days instead of regenerating.
 
     The data tree is isomorphic to the checkpoint tree (README.md): the same
     config-identifying prefix, rooted at model_output/ instead of
@@ -459,7 +483,9 @@ def _data_path_from_checkpoint(model_checkpoint, duration, ic,
         filter_tag = f"_filter_a{filter_a:g}_p{filter_p:g}" if (filter_a is not None or filter_p is not None) else ""
         file_name = f"{_date_tag(ic_time)}{filter_tag}.pt"
     else:
-        file_name = "model_output.pt"
+        spinup_tag = f"_spinup_{_fmt_duration(spinup_days)}" if spinup_days else ""
+        variant_suffix = f"_{variant_tag}" if variant_tag else ""
+        file_name = f"model_output{spinup_tag}{variant_suffix}.pt"
 
     if is_neural:
         parts += ["single" if single_step else "multi"]
@@ -479,13 +505,20 @@ def run(model_checkpoint,
         single_step=True,
         phi_eq_spec=None,
         filter_a=None,
-        filter_p=None):
+        filter_p=None,
+        spinup_days=None,
+        variant_tag=None):
     """
         A ubiquitous interface for both inferencing SFNO and psuedospectral simulation.
         Generates a .pt file of prediction data, then returns its path.
 
         Args:
             model_checkpoint: path to the model checkpoint directory
+            variant_tag:      galewsky only - see _data_path_from_checkpoint's
+                              own docstring; distinguishes multiple galewsky
+                              trajectories generated off the same checkpoint
+                              (e.g. a parameter-varied training set) so they
+                              don't collide on the same output filename.
             initial_condition: state at t_0 (spectral (3, lmax, mmax); units
                               dictated by model_checkpoint's own
                               model_info.json - see non_dimensional below.
@@ -501,6 +534,12 @@ def run(model_checkpoint,
                               _data_path_from_checkpoint) so a re-run with a
                               different filter doesn't silently reuse another
                               filter setting's cached trajectory.
+            spinup_days:      how long `initial_condition` was integrated
+                              forward before this call (galewsky only - see
+                              _data_path_from_checkpoint's own docstring for
+                              why this must be tagged into the cache key).
+                              Purely a naming-convention/cache-key input;
+                              ignored for ic == "real_world".
             dataset_name:     required when ic == "real_world", *except* a
                               numerical checkpoint already tied to one dataset
                               (see numerical_checkpoint_path) - passing a
@@ -563,6 +602,7 @@ def run(model_checkpoint,
         model_checkpoint, duration, ic,
         pressure=pressure, ic_time=ic_time, dataset_name=dataset_name,
         single_step=single_step, filter_a=filter_a, filter_p=filter_p,
+        spinup_days=spinup_days, variant_tag=variant_tag,
     )
 
     # resolved before touching model_checkpoint's own model_info.json at all,

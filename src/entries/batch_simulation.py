@@ -2,21 +2,32 @@
 Generate slurm scripts to batch numerical simulation with different initial
 conditions.
 
-Given a dataset_name (see `make download_era5` / reanalysis_data/<name>/data.nc)
-and the solver configuration, this enumerates every time point along the
-``time_dim`` coordinate and submits one independent sbatch job per time point. Each job gets its own small YAML config (just a
-``run_solver:`` section, identical in shape to config.yml's) with ``ic_time``
-set to that job's time point, and invokes ``run_solver.py`` with it - mirroring
-how `make run_solver` itself is invoked (see makefile), since run_solver.py
-now reads its configuration from a YAML file rather than CLI flags.
+Two modes (``mode`` in config, see DEFAULT_CONFIG):
+
+  "real_world" (default): given a dataset_name (see `make download_era5` /
+    reanalysis_data/<name>/data.nc) and the solver configuration, this
+    enumerates every time point along the ``time_dim`` coordinate and submits
+    one independent sbatch job per time point.
+
+  "galewsky": no dataset - instead samples ``n_jobs`` random combinations of
+    galewsky_initial_condition's own parameters (umax, jet placement,
+    perturbation location/amplitude/noise - see the *_range knobs below) so
+    the resulting trajectories form a varied TRAINING SET (many distinct
+    barotropically-unstable jets) rather than the one canned test case.
+
+Either way, each job gets its own small YAML config (just a ``run_solver:``
+section, identical in shape to config.yml's) and invokes ``run_solver.py``
+with it - mirroring how `make run_solver` itself is invoked (see makefile),
+since run_solver.py now reads its configuration from a YAML file rather than
+CLI flags.
 
 Since each job is its own independent sbatch process, `run_solver.py` cannot
 share an in-memory dataset across jobs. Instead, this script opens and loads
-the (potentially large, multi-year) ERA5 dataset exactly once here, slices
-out just the one time point each job needs, and writes that slice to a small
-per-job NetCDF file (``ic_data_dir``). Each job's config points at its own
-slice via ``ic_time`` / ``ic_data_path``, so `run_solver.py` only ever opens
-that tiny file instead of re-loading the full dataset per job.
+the (potentially large, multi-year) ERA5 dataset exactly once here (real_world
+mode only), slices out just the one time point each job needs, and writes
+that slice to a small per-job NetCDF file (``ic_data_dir``). Each job's config
+points at its own slice via ``ic_time`` / ``ic_data_path``, so `run_solver.py`
+only ever opens that tiny file instead of re-loading the full dataset per job.
 
 Configuration is read from the ``batch_simulation`` section of config.yml
 (pass an alternative path as the first CLI argument), matching the
@@ -60,13 +71,28 @@ DEFAULT_PYTHON = (
 
 
 DEFAULT_CONFIG = {
-    # ------------------------- data / time selection ------------------------- #
+    # "real_world" (iterate an ERA5 dataset's own time points) or "galewsky"
+    # (sample random galewsky_initial_condition parameter combinations) - see
+    # module docstring.
+    "mode": "real_world",
+
+    # ------------------------- data / time selection (real_world only) -------- #
     "dataset_name": None,            # required, e.g. "1980_2025_odd_month" -> reanalysis_data/<name>/data.nc
     "time_dim": "valid_time",
     "engine": None,                  # xarray engine (e.g. 'cfgrib' for grib); default: auto-detect
     "time_filter": None,             # null | "first_of_month" (see _TIME_FILTERS); applied before stride/limit
     "stride": 1,                     # use every Nth (post-filter) time point
     "limit": None,                   # only submit the first N (post-filter, post-stride) time points
+
+    # ------------------------- galewsky parameter sampling (galewsky only) ---- #
+    "n_jobs": 100,                    # number of random parameter combinations to submit
+    "seed": 0,                        # RNG seed - reruns regenerate the identical sweep
+    "galewsky_umax_range": [50., 110.],
+    "galewsky_usouth_range": [0.08, 0.20],
+    "galewsky_unorth_range": [0.30, 0.45],
+    "galewsky_perturb_loc_range": [0.10, 0.40],
+    "galewsky_perturb_amp_range": [0.5, 1.5],
+    "galewsky_noise_level_range": [0.5, 1.5],
 
     # ------------------------- solver configuration --------------------------- #
     # forwarded into each job's own run_solver.py config
@@ -117,6 +143,7 @@ def load_config():
     raw = load_raw_config("batch_simulation", DEFAULT_CONFIG)
 
     # normalize types regardless of YAML formatting
+    raw["mode"] = raw["mode"] or "real_world"
     raw["lmax"] = int(raw["lmax"])
     raw["tau"] = [int(t) for t in raw["tau"]]
     raw["cfl"] = float(raw["cfl"])
@@ -124,6 +151,12 @@ def load_config():
     raw["save_interval_minutes"] = float(raw["save_interval_minutes"])
     raw["stride"] = int(raw["stride"])
     raw["limit"] = int(raw["limit"]) if raw["limit"] is not None else None
+    raw["n_jobs"] = int(raw["n_jobs"])
+    raw["seed"] = int(raw["seed"])
+    for key in ("galewsky_umax_range", "galewsky_usouth_range", "galewsky_unorth_range",
+                "galewsky_perturb_loc_range", "galewsky_perturb_amp_range",
+                "galewsky_noise_level_range"):
+        raw[key] = [float(x) for x in raw[key]]
     raw["cpus"] = int(raw["cpus"])
     raw["a"] = float(raw["a"])
     raw["p"] = float(raw["p"])
@@ -137,17 +170,20 @@ def load_config():
 
     cfg = SimpleNamespace(**raw)
 
-    if not cfg.dataset_name:
-        raise ValueError("batch_simulation.dataset_name is required.")
-    if cfg.pressure is None:
-        raise ValueError("batch_simulation.pressure is required (used for naming), e.g. 500.")
+    if cfg.mode not in ("real_world", "galewsky"):
+        raise ValueError(f"batch_simulation.mode must be 'real_world' or 'galewsky', got {cfg.mode!r}.")
+    if cfg.mode == "real_world":
+        if not cfg.dataset_name:
+            raise ValueError("batch_simulation.dataset_name is required when mode == 'real_world'.")
+        if cfg.pressure is None:
+            raise ValueError("batch_simulation.pressure is required (used for naming), e.g. 500.")
+        if cfg.time_filter is not None and cfg.time_filter not in _TIME_FILTERS:
+            raise ValueError(
+                f"batch_simulation.time_filter must be one of {list(_TIME_FILTERS)} or null, "
+                f"got {cfg.time_filter!r}."
+            )
     if cfg.rad and cfg.tau_rad is None:
         raise ValueError("batch_simulation.tau_rad is required when rad=True.")
-    if cfg.time_filter is not None and cfg.time_filter not in _TIME_FILTERS:
-        raise ValueError(
-            f"batch_simulation.time_filter must be one of {list(_TIME_FILTERS)} or null, "
-            f"got {cfg.time_filter!r}."
-        )
     return cfg
 
 
@@ -218,8 +254,9 @@ def prepare_ic_slices(dataset_name, time_dim, engine, stride, limit, ic_data_dir
     return jobs
 
 
-def build_run_solver_config(ic_time, ic_data_path, cfg):
-    """The ``run_solver:`` section for this job (see run_solver.py's DEFAULT_CONFIG)."""
+def build_run_solver_config_real_world(ic_time, ic_data_path, cfg):
+    """The ``run_solver:`` section for this real_world-mode job (see
+    run_solver.py's DEFAULT_CONFIG)."""
     return {
         "run_solver": {
             "lmax": cfg.lmax,
@@ -246,18 +283,54 @@ def build_run_solver_config(ic_time, ic_data_path, cfg):
     }
 
 
-def build_script(ic_time, ic_data_path, index, cfg, abs_config_dir, abs_log_dir):
-    """Write this job's run_solver.py config and render its sbatch script text."""
-    job_name = f"{cfg.job_name_prefix}_{index:04d}"
+def sample_galewsky_params(n_jobs, seed, cfg):
+    """``n_jobs`` random galewsky_initial_condition parameter combinations,
+    uniformly sampled within cfg's own *_range knobs - a fixed seed makes the
+    sweep reproducible (re-running the config regenerates the identical set).
+    usouth_range's max is kept below unorth_range's min (DEFAULT_CONFIG's
+    defaults do this) so the jet band (usouth, unorth) is always a valid,
+    non-empty latitude band regardless of what's independently sampled for
+    each."""
+    rng = np.random.default_rng(seed)
+    keys = ("umax", "usouth", "unorth", "perturb_loc", "perturb_amp", "noise_level")
+    sampled = {
+        key: rng.uniform(*getattr(cfg, f"galewsky_{key}_range"), size=n_jobs)
+        for key in keys
+    }
+    return [{key: float(sampled[key][i]) for key in keys} for i in range(n_jobs)]
 
-    job_config_path = abs_config_dir / f"{job_name}.yml"
-    job_config_path.write_text(
-        yaml.safe_dump(build_run_solver_config(ic_time, ic_data_path, cfg), sort_keys=False)
-    )
 
-    # Every directive here comes straight from config (cfg.*) -- nothing
-    # cluster-specific is baked into this function itself, so retargeting the
-    # pipeline at a different slurm cluster only means editing config.yml.
+def build_run_solver_config_galewsky(params, variant_tag, cfg):
+    """The ``run_solver:`` section for this galewsky-mode job."""
+    return {
+        "run_solver": {
+            "lmax": cfg.lmax,
+            "tau": list(cfg.tau),
+            "cfl": cfg.cfl,
+            "grid": cfg.grid,
+            "semi_implicit": cfg.semi_implicit,
+            "dealias": cfg.dealias,
+            "non_dimensional": cfg.non_dimensional,
+            "duration": cfg.duration,
+            "save_interval_minutes": cfg.save_interval_minutes,
+            "ic": "galewsky",
+            "galewsky_umax": params["umax"],
+            "galewsky_usouth": params["usouth"],
+            "galewsky_unorth": params["unorth"],
+            "galewsky_perturb_loc": params["perturb_loc"],
+            "galewsky_perturb_amp": params["perturb_amp"],
+            "galewsky_noise_level": params["noise_level"],
+            "variant_tag": variant_tag,
+            "checkpoint_only": False,
+        }
+    }
+
+
+def render_sbatch_script(job_name, job_config_path, echo_line, cfg, abs_log_dir):
+    """Render this job's sbatch script text (shared by both modes). Every
+    directive here comes straight from config (cfg.*) -- nothing
+    cluster-specific is baked into this function itself, so retargeting the
+    pipeline at a different slurm cluster only means editing config.yml."""
     sbatch_lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
@@ -287,13 +360,13 @@ def build_script(ic_time, ic_data_path, index, cfg, abs_config_dir, abs_log_dir)
         body += [f"module load {name}" for name in cfg.modules]
     body += [
         f"cd {PROJECT_ROOT}",
-        f'echo "Running real-world simulation for ic_time={ic_time}"',
+        f'echo "{echo_line}"',
         # mirrors `make run_solver` (see makefile): run_solver.py is invoked as a
         # module and takes its config as a single positional YAML path.
         f"{cfg.python} -m src.entries.run_solver {job_config_path}",
         "",
     ]
-    return job_config_path, "\n".join(sbatch_lines + body)
+    return "\n".join(sbatch_lines + body)
 
 
 def main():
@@ -306,25 +379,44 @@ def main():
     for d in (script_dir, log_dir, config_dir, ic_data_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading '{cfg.dataset_name}' once and slicing per-job initial conditions...")
-    jobs = prepare_ic_slices(
-        cfg.dataset_name, cfg.time_dim, cfg.engine, cfg.stride, cfg.limit,
-        ic_data_dir, cfg.job_name_prefix, time_filter=cfg.time_filter,
-    )
-    if not jobs:
-        sys.exit("No time points selected; nothing to submit.")
+    if cfg.mode == "real_world":
+        print(f"Loading '{cfg.dataset_name}' once and slicing per-job initial conditions...")
+        raw_jobs = prepare_ic_slices(
+            cfg.dataset_name, cfg.time_dim, cfg.engine, cfg.stride, cfg.limit,
+            ic_data_dir, cfg.job_name_prefix, time_filter=cfg.time_filter,
+        )
+        if not raw_jobs:
+            sys.exit("No time points selected; nothing to submit.")
+        jobs = [
+            (f"{cfg.job_name_prefix}_{i:04d}",
+             build_run_solver_config_real_world(ic_time, ic_data_path, cfg),
+             f"Running real-world simulation for ic_time={ic_time}")
+            for i, (ic_time, ic_data_path) in enumerate(raw_jobs)
+        ]
+    else:
+        print(f"Sampling {cfg.n_jobs} galewsky parameter combination(s) (seed={cfg.seed})...")
+        param_sets = sample_galewsky_params(cfg.n_jobs, cfg.seed, cfg)
+        jobs = [
+            (f"{cfg.job_name_prefix}_{i:04d}",
+             build_run_solver_config_galewsky(params, f"{cfg.job_name_prefix}_{i:04d}", cfg),
+             f"Running galewsky simulation: {params}")
+            for i, params in enumerate(param_sets)
+        ]
 
-    print(f"Selected {len(jobs)} time point(s); "
+    print(f"Selected {len(jobs)} job(s); "
           f"{'generating (dry run)' if cfg.dry_run else 'submitting'} jobs...")
 
     submitted = 0
-    for i, (ic_time, ic_data_path) in enumerate(jobs):
-        job_config_path, script_text = build_script(ic_time, ic_data_path, i, cfg, config_dir, log_dir)
-        script_path = script_dir / f"{cfg.job_name_prefix}_{i:04d}.slurm"
+    for job_name, run_solver_config, echo_line in jobs:
+        job_config_path = config_dir / f"{job_name}.yml"
+        job_config_path.write_text(yaml.safe_dump(run_solver_config, sort_keys=False))
+
+        script_text = render_sbatch_script(job_name, job_config_path, echo_line, cfg, log_dir)
+        script_path = script_dir / f"{job_name}.slurm"
         script_path.write_text(script_text)
 
         if cfg.dry_run:
-            print(f"[dry-run] {script_path}  (ic_time={ic_time}, config={job_config_path})")
+            print(f"[dry-run] {script_path}  (config={job_config_path})")
             continue
 
         result = subprocess.run(
@@ -332,9 +424,9 @@ def main():
             capture_output=True, text=True,
         )
         if result.returncode != 0:
-            print(f"[FAILED] ic_time={ic_time}: {result.stderr.strip()}", file=sys.stderr)
+            print(f"[FAILED] {job_name}: {result.stderr.strip()}", file=sys.stderr)
         else:
-            print(f"[ok] ic_time={ic_time} -> {result.stdout.strip()}")
+            print(f"[ok] {job_name} -> {result.stdout.strip()}")
             submitted += 1
 
     if cfg.dry_run:
