@@ -16,6 +16,8 @@ from src.helpers.run_model import (
     load_h_stats,
     physical_scales,
     physical_to_nondim,
+    DEFAULT_HAVG,
+    DEFAULT_HAMP,
 )
 
 
@@ -31,7 +33,7 @@ class SWEDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, simulation_data_dir, n_future, mode='absolute', seed=None,
-                 samples_per_file=1, cache_in_memory=True):
+                 samples_per_file=1, cache_in_memory=True, T=None, U=None):
         self.simulation_data_dir = simulation_data_dir
         self.nfuture = n_future
         self.mode= mode
@@ -97,15 +99,49 @@ class SWEDataset(torch.utils.data.Dataset):
 
         # non-dimensionalization scales (T, U), keyed by this training data's
         # own dataset-wide h_avg (README.md convention: recovered from
-        # simulation_data_dir's own dataset_*/pressure_* path nodes) - (None,
-        # None)/DEFAULT_HAVG fallback for galewsky-only data, which has no
-        # real-world dataset. Used in place of a z-score to scale samples
-        # in __getitem__ below.
+        # simulation_data_dir's own dataset_*/pressure_* path nodes) -
+        # (DEFAULT_HAVG, DEFAULT_HAMP) fallback for galewsky-only data, which
+        # has no real-world dataset: these are the exact literal defaults
+        # ShallowWaterSolver itself falls back to (see its h_avg/h_amp=None
+        # branch) when run_solver.py generates galewsky training trajectories
+        # (ic="galewsky" passes no h_avg/h_amp), so recording them here (rather
+        # than None) makes model_info.json accurately reflect what those
+        # trajectories were actually non-dimensionalized with - see
+        # inference.py's run_rollout_pair, which for ic="galewsky" reads this
+        # same model_info["h_avg"]/["h_amp"] back out and would previously
+        # crash formatting None with ":.2f". Used in place of a z-score to
+        # scale samples in __getitem__ below.
         self.dataset_name, self.pressure = parse_dataset_and_pressure(self.simulation_data_dir)
-        self.h_avg, self.h_amp = (
-            load_h_stats(self.dataset_name) if self.dataset_name else (None, None)
-        )
-        self.T, self.U = physical_scales(self.h_avg)
+        scales_overridden = T is not None and U is not None
+        if not self.dataset_name:
+            self.h_avg, self.h_amp = DEFAULT_HAVG, DEFAULT_HAMP
+        else:
+            try:
+                self.h_avg, self.h_amp = load_h_stats(self.dataset_name)
+            except FileNotFoundError:
+                if not scales_overridden:
+                    raise
+                # h_stats.npz exists only to feed physical_scales below, which
+                # an explicit (T, U) replaces outright - so a caller supplying
+                # both must not be blocked by a reanalysis file this run never
+                # reads (the trajectories themselves are already on disk; the
+                # source dataset may well have been cleaned up since). h_avg/
+                # h_amp stay unknown and are recorded as such.
+                self.h_avg = self.h_amp = None
+        # An explicit (T, U) overrides this directory's own derived scales.
+        # Needed when the samples feed a model whose weights were already
+        # trained under a DIFFERENT domain's scales (see
+        # train_domain_merge.py): a network has exactly one input scale and
+        # one output scale, and inference reconstructs physical units from
+        # the single T/U recorded in its model_info.json - so every domain
+        # mixed into one model must be non-dimensionalized identically, or
+        # the same physical field would reach the network as two different
+        # inputs depending on which directory it came from. Same reasoning
+        # as SWEMultiStepDataset, which likewise takes T/U from the
+        # pretrained checkpoint rather than re-deriving them here.
+        derived_T, derived_U = physical_scales(self.h_avg)
+        self.T = derived_T if T is None else float(T)
+        self.U = derived_U if U is None else float(U)
 
         # step_window spans the whole trajectory: any start step whose n_future
         # target still lands inside the trajectory. Inferred from its length.
@@ -188,6 +224,72 @@ class SWEDataset(torch.utils.data.Dataset):
             return u_curr.clone(), (u_next-u_curr).clone(), (index, step_start)
         elif self.mode == 'absolute':
             return u_curr.clone(), u_next.clone(), (index, step_start)
+
+
+class DomainMixtureDataset(torch.utils.data.Dataset):
+    """Two single-step domains (see SWEDataset) sampled together, with a
+    tunable probability of drawing from the SECOND one - the training set
+    behind train_domain_merge.py's curriculum.
+
+    ``base`` is D1 (the domain the model being fine-tuned was originally
+    trained on) and ``new`` is D2 (the domain being merged in). Each
+    ``__getitem__`` independently draws from ``new`` with probability
+    ``p_new`` and from ``base`` otherwise, so raising ``p_new`` over the
+    course of training (see set_new_domain_probability) gradually shifts the
+    mixture from pure-D1 toward the requested D1/D2 blend rather than
+    switching domains abruptly.
+
+    ``__len__`` is ``len(base)``, NOT ``len(base) + len(new)``: one epoch is
+    a fixed number of samples regardless of ``p_new``, so epoch wall-time and
+    the number of optimizer steps per epoch stay constant as the curriculum
+    advances (the LR schedule is indexed in epochs, so a mixture that grew
+    the epoch would silently change what one scheduler step means). Raising
+    p_new therefore REPLACES D1 samples with D2 samples rather than adding to
+    them, which is what makes "50% D2" mean a half-and-half batch.
+
+    Both domains are indexed independently modulo their own length, so they
+    need not be the same size; D2 is simply revisited more or less often than
+    D1 relative to its size.
+    """
+
+    # domain ids returned as each sample's third element, in place of
+    # SWEDataset's own (index, step_start) provenance tuple - collated by the
+    # DataLoader into a (batch,) tensor, which is what lets the trainer
+    # measure the REALIZED mixture fraction per epoch instead of trusting the
+    # scheduled probability (they differ by sampling noise, and only the
+    # realized one describes what the weights actually saw).
+    BASE_DOMAIN_ID = 0
+    NEW_DOMAIN_ID = 1
+
+    def __init__(self, base, new, seed=0):
+        self.base = base
+        self.new = new
+        self.p_new = 0.0
+        # Own RNG instance rather than the global `random` module: the
+        # DataLoader runs single-process (num_workers=0 - see
+        # train_singlestep.py), so this is deterministic given `seed` and
+        # can't be perturbed by, or perturb, any other consumer of the
+        # global stream.
+        self._rng = random.Random(seed)
+
+    def set_new_domain_probability(self, p_new):
+        """Set the per-sample probability of drawing from D2. Called once per
+        epoch by the trainer's curriculum (see train_domain_merge.py's
+        sigmoid_domain_probability)."""
+        if not 0.0 <= p_new <= 1.0:
+            raise ValueError(f"p_new must be in [0, 1], got {p_new}")
+        self.p_new = float(p_new)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, index):
+        if self._rng.random() < self.p_new:
+            dataset, domain_id = self.new, self.NEW_DOMAIN_ID
+        else:
+            dataset, domain_id = self.base, self.BASE_DOMAIN_ID
+        inp, tar, _ = dataset[index % len(dataset)]
+        return inp, tar, domain_id
 
 
 class SWEMultiStepDataset(torch.utils.data.Dataset):
